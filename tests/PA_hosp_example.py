@@ -84,7 +84,7 @@ if __name__ == "__main__":
 
     sns.boxplot(puca_model.post_samples["w"], fliersize=0)
     ax.set_xlabel("Seasons")
-    ax.set_yticks("Similarity (measured as weight)")
+    ax.set_ylabel("Similarity (measured as weight)G")
     
 
     plt.show()
