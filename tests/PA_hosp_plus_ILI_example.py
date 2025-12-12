@@ -66,9 +66,8 @@ if __name__ == "__main__":
     forecasts = puca_model.forecast()
 
     natural_scale_forecasts = forecasts["forecast_natural"]
-    organized_dataset = puca_model.d_wide
     
-    this_season_data = organized_dataset.iloc[:,-1].values
+    this_season_data = target_y
     last_obs = np.min(np.argwhere(np.isnan(this_season_data)))
 
     #--plot
@@ -86,14 +85,16 @@ if __name__ == "__main__":
     ax.scatter( weeks, this_season_data, s=8,  color="black" )
 
     #--past seasonal data
-    ax.plot( organized_dataset.to_numpy()[:,:-1], color = "black", alpha=0.1, lw=0.5 )
+    for season_data, weight in zip(past_y.T, np.abs(puca_model.post_samples["w"].mean(0))):
+        ax.plot( season_data, color = "black", alpha=weight, lw=4*weight )
     
     #--puca forecast
-    _25,_250,_500,_750,_900,_975 = np.percentile( natural_scale_forecasts, [2.5, 25,50,75,90,97.5],axis=0 )
+    _25,_10,_250,_500,_750,_900,_975 = np.percentile( natural_scale_forecasts, [2.5, 10, 25,50,75,90,97.5],axis=0 )
 
     ax.plot( weeks[last_obs:], _500[last_obs:] )
-    ax.fill_between( weeks[last_obs:], _25[last_obs:], _975[last_obs:], color = "blue", alpha=0.25 )
-    ax.fill_between( weeks[last_obs:], _250[last_obs:], _750[last_obs:], color = "blue", alpha=0.25 )
+    ax.fill_between( weeks[last_obs:], _25[last_obs:] , _975[last_obs:], color = "blue" , alpha=0.15 )
+    ax.fill_between( weeks[last_obs:], _10[last_obs:] , _900[last_obs:], color = "blue" , alpha=0.15 )
+    ax.fill_between( weeks[last_obs:], _250[last_obs:], _750[last_obs:], color = "blue", alpha=0.15 )
 
     ax.set_xlabel("")
     ax.set_xlim(0,33)
@@ -105,7 +106,7 @@ if __name__ == "__main__":
     ax = fig.add_subplot(gs[1,0])
 
     fundemental_shapes = puca_model.post_samples["L"].mean(0)
-    importances        = 10*np.abs(puca_model.post_samples["betas"].mean(0))
+    importances        = 2*np.abs(puca_model.post_samples["betas"].mean(0))
 
     for (shape,importance) in zip( fundemental_shapes.T, importances ):
         ax.plot(shape, lw = importance)
@@ -122,9 +123,9 @@ if __name__ == "__main__":
     ax.set_xlabel("")
     ax.set_ylabel("Similarity")
 
-    seasons = [y for x,y in organized_dataset.columns[:-1]]
+    seasons = [y for x,y in hosp_data__wide.columns[:-1]]
     ax.set_xticks(np.arange(len(seasons)))
-    ax.set_xlabel("X Factors")
+    ax.set_xticklabels(seasons, rotation=35)
 
     fig.set_size_inches( (8.5-2)/2, (11-2)/3 )
     fig.set_tight_layout(True)
