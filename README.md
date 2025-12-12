@@ -10,5 +10,5 @@
 ## Exampels of XXX forecasting 
 
 ## Contributors:
-tom mcandrew - mcandrew@lehigh.edu (https://compuncertlab.org/)
+tom mcandrew - mcandrew@lehigh.edu (https://compuncertlab.org/)   
 Garrik Hoyt - gah223@lehigh.edu
