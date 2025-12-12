@@ -44,6 +44,7 @@ if __name__ == "__main__":
     hosp_data       = add_season_info(hosp_data)
     hosp_data       = hosp_data.loc[ (hosp_data.location==STATE) & (hosp_data.season!="offseason") ]
     hosp_data__wide = pd.pivot_table( index = ["MMWRWK"], columns = ["season"], values = ["value"], data = hosp_data )
+    hosp_data__wide = hosp_data__wide.loc[ list(np.arange(40,52+1)) + list(np.arange(1,20+1))]
     
     ili_data  = ili_data.loc[ili_data.state=="pa", ["year","week","season","ili"]]
     ili_data  = ili_data.loc[~ili_data.season.isin(["2020/2021","2021/2022"])]
@@ -52,9 +53,13 @@ if __name__ == "__main__":
     ili_data__wide = pd.pivot_table( index = ["MMWRWK"], columns = ["season"], values = ["ili"], data = ili_data )
     ili_data__wide = ili_data__wide.loc[ list(np.arange(40,52+1)) + list(np.arange(1,20+1))]
 
-    d_wide = pd.concat( [ ili_data__wide, hosp_data__wide], axis=1) #<--concat all the columns together.
-
-    puca_model = puca(d_wide = d_wide)
+    X        = ili_data__wide.to_numpy()
+    past_y   = hosp_data__wide.to_numpy()[:,:-1] #<--last column is the target
+    target_y = hosp_data__wide.to_numpy()[:,-1]
+    
+    puca_model = puca(  target_y = target_y
+                        , past_y = past_y
+                        , X      = X)
     
     puca_model.fit(use_anchor=True)
 
@@ -63,7 +68,6 @@ if __name__ == "__main__":
     natural_scale_forecasts = forecasts["forecast_natural"]
     organized_dataset = puca_model.d_wide
     
-
     this_season_data = organized_dataset.iloc[:,-1].values
     last_obs = np.min(np.argwhere(np.isnan(this_season_data)))
 
@@ -71,7 +75,7 @@ if __name__ == "__main__":
     plt.style.use("science")
     
     fig = plt.figure()
-    gs = GridSpec(2, 2, width_ratios=[1, 1], height_ratios=[2, 1])
+    gs  = GridSpec(2, 2, width_ratios=[1, 1], height_ratios=[2, 1])
 
     ax = fig.add_subplot(gs[0,:])
 

@@ -2,15 +2,12 @@
 
 class puca( object ):
 
-    def __init__(self,d=None, d_wide=None):
-
-        if d is not None:
-            self.d = d
-            self.organize_data(d=d)
-            
-        elif d_wide is not None:
-            self.d = None
-            self.organize_data(d_wide=d_wide)
+    def __init__(self,target_y=None, past_y = None, X = None):
+        self.X__input         = X
+        self.target_y__input  = target_y
+        self.past_y__input    = past_y
+        
+        self.organize_data()
 
     def smooth_gaussian_anchored(self,x, sigma=2.0):
         import numpy as np
@@ -37,41 +34,52 @@ class puca( object ):
         y[-1] = x[-1]
         return y
        
-    def organize_data(self, d=None, d_wide=None):
+    def organize_data(self):
         import pandas as pd
         import numpy as np
 
-        if d is not None:
-            d_wide = pd.pivot_table( index = ["MMWRWK"], columns = ["season"], values = ["value"], data = self.d )
-        else:
-            pass
+        # if d is not None:
+        #     d_wide = pd.pivot_table( index = ["MMWRWK"], columns = ["season"], values = ["value"], data = self.d )
+        # else:
+        #     pass
 
-        try:
-            d_wide = d_wide.loc[ list(np.arange(40,53+1)) + list(np.arange(1,20+1))  ]
-        except KeyError:
-            d_wide = d_wide.loc[ list(np.arange(40,52+1)) + list(np.arange(1,20+1))  ]
+        # try:
+        #     d_wide = d_wide.loc[ list(np.arange(40,53+1)) + list(np.arange(1,20+1))  ]
+        # except KeyError:
+        #     d_wide = d_wide.loc[ list(np.arange(40,52+1)) + list(np.arange(1,20+1))  ]
             
-        self.d_wide = d_wide
+        #self.d_wide = d_wide
 
         #--fill in any odd banks
-        d_numeric = d_wide#.to_numpy() 
+        #d_numeric = d_wide#.to_numpy() 
 
+        #--we should store the centers and sclaes from past copies of y.
+        #--this will be used in prediction and forecasting.
+        d_numeric = self.past_y__input
+        
         centers   = np.nanmean(d_numeric,axis=0)
         scales    = np.nanstd( d_numeric,axis=0).reshape(1,-1)
-
-        centers[-1]   = np.mean(centers[:-1])
-        scales[0,-1]  = np.mean(scales[0, :-1])
-        d_scaled      = (d_numeric - centers) / scales
-
-        xdata             = d_scaled.iloc[:,:-1]
-        xdata.iloc[0,:]   = np.nan_to_num(xdata.iloc[0,:] , nan= np.nanmean(xdata.iloc[0,:]) )
-        xdata.iloc[-1,:]  = np.nan_to_num(xdata.iloc[-1,:], nan= np.nanmean(xdata.iloc[-1,:]) )
-        xdata             = xdata.interpolate().to_numpy()
 
         self.centers = centers
         self.scales = scales
 
-        y,X = d_numeric.to_numpy()[:,-1], xdata
+        #--now we should center and scale both past y and X (is X exists) to help us predict target_y
+        if self.X__input is not None:
+            d_numeric = np.hstack([self.past_y__input, self.X__input])
+            
+        centers   = np.nanmean(d_numeric,axis=0)
+        scales    = np.nanstd( d_numeric,axis=0).reshape(1,-1)
+
+        centers   = np.mean(centers)
+        scales    = np.mean(scales)
+        d_scaled  = (d_numeric - centers) / scales
+        
+        xdata             = pd.DataFrame(d_scaled)
+        xdata.iloc[0,:]   = np.nan_to_num(xdata.iloc[0,:] , nan= np.nanmean(xdata.iloc[0,:]) )
+        xdata.iloc[-1,:]  = np.nan_to_num(xdata.iloc[-1,:], nan= np.nanmean(xdata.iloc[-1,:]) )
+        xdata             = xdata.interpolate().to_numpy()
+
+        y,X = self.target_y__input, xdata
 
         smooth_X = []
         for column in X.T:
@@ -79,16 +87,19 @@ class puca( object ):
         smooth_X = np.array(smooth_X).T
 
         self.y=y
-        self.X=smooth_X
+        self.X=smooth_X #<--this includes both past_y and X. However, we should make a distinction and store those
+
+        self.past_y_scaled = smooth_X[:, :self.past_y__input.shape[-1] ]
 
         return y,smooth_X
 
-    def model(self,y,X,LMAX,forecast=False, centers = None, scales = None, anchor = None, obs=None,test=None):
+    def model(self,y,X,past_y,LMAX,forecast=False, centers = None, scales = None, anchor = None, obs=None,test=None):
         import numpyro
         import numpyro.distributions as dist
         import jax.numpy as jnp
  
-        T,S = X.shape
+        T,S     = X.shape
+        ncopies = past_y.shape[-1]
 
         #--smooth X
         #lam = numpyro.sample("smooth_strength", dist.Beta(2., 2.).expand([S]))
@@ -158,7 +169,7 @@ class puca( object ):
         Cobs = Cobs + (sigma_y) * jnp.eye(len(obs))
 
         #--multi task learning approach for cetner and scales
-        w = numpyro.sample("w", dist.Dirichlet((1./S)*jnp.ones(S)))
+        w = numpyro.sample("w", dist.Dirichlet((1./ncopies)*jnp.ones(ncopies)))
 
         center = jnp.sum(centers*w)
         scale  = jnp.sum(scales*w)
@@ -207,7 +218,8 @@ class puca( object ):
         from numpyro.infer import MCMC, NUTS
         jax.clear_caches()
 
-        y,X = self.y, self.X
+        y,X    = self.y, self.X
+        past_y = self.past_y_scaled
 
         if estimate_lmax:
             try:
@@ -222,7 +234,7 @@ class puca( object ):
         self.estimated_factors = estimated_factors
 
         if use_anchor:
-            anchor = ( np.nanmean(X[-1,:]), np.nanstd(X[-1,:]) )
+            anchor = ( np.nanmean(past_y[-1,:]), np.nanstd(past_y[-1,:]) )
         else:
             anchor=None
         self.anchor = anchor
@@ -232,10 +244,11 @@ class puca( object ):
         mcmc.run(jax.random.PRNGKey(20200320)
                  ,y                     = y
                  ,X                     = X
+                 ,past_y                = past_y
                  ,LMAX                  = estimated_factors
                  ,forecast              = False
-                 ,centers               = self.centers[:-1].reshape(-1,)
-                 ,scales                = self.scales[0,:-1].reshape(-1,)
+                 ,centers               = self.centers.reshape(-1,)
+                 ,scales                = self.scales[0].reshape(-1,)
                  , obs                  = np.where(~np.isnan(y)) [0]
                  , test                 = np.where( np.isnan(y)) [0]
                  ,anchor = anchor)
@@ -253,15 +266,17 @@ class puca( object ):
         import numpy as np 
         
         y,X = self.y, self.X
+        past_y = self.past_y_scaled
 
         predictive   = Predictive(self.model, posterior_samples=self.post_samples)
         pred_samples = predictive(jax.random.PRNGKey(20200320)
                                   , y=y
                                   , X=X
+                                  , past_y                = past_y
                                   , LMAX=self.estimated_factors
                                   , forecast              = True
-                                  , centers               = self.centers[:-1].reshape(-1,)
-                                  , scales                = self.scales[0,:-1].reshape(-1,)
+                                  , centers               = self.centers.reshape(-1,)
+                                  , scales                = self.scales[0].reshape(-1,)
                                   , anchor                = self.anchor
                                   , obs                   = np.where(~np.isnan(y)) [0]
                                   , test                  = np.where( np.isnan(y)) [0])
