@@ -10,9 +10,10 @@ import jax.scipy.linalg as jsp
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO, Predictive, init_to_median
+from numpyro.infer import MCMC, NUTS, Predictive, init_to_median, DiscreteHMCGibbs
 from numpyro.infer.initialization import init_to_value
 from functools import partial
+import jax.scipy.linalg as jsp_linalg
 
 
 class puca( object ):
@@ -70,7 +71,7 @@ class puca( object ):
 
         #--split y data into examples from the past and the targets
         Y,y                 = zip(*[ (np.delete(_,t,axis=1), _[:,t])  for t,_ in zip(target_indicators, y_input)])
-
+        
         #--This block standardizes Y data to z-scores, collects the mean and sd, and smooths past Ys.
         all_y             = np.array([])
         smooth_ys         = [] 
@@ -82,18 +83,25 @@ class puca( object ):
             y_means.append(means)
             y_scales.append(scales)
 
-            past_smooth       =  self.smooth_gaussian_anchored(past,2)
-            past_smooth_means =  np.mean(past_smooth,axis=0)
-            past_smooth_stds  =  np.std(past_smooth,axis=0)
+            smooth_y       =  self.smooth_gaussian_anchored(past,2)
+            #past_smooth_means =  np.mean(past_smooth,axis=0)
+            #past_smooth_stds  =  np.std(past_smooth,axis=0)
 
-            smooth_y          = (past_smooth - past_smooth_means)/past_smooth_stds
+            #smooth_y          = (past_smooth - past_smooth_means)/past_smooth_stds
             smooth_ys.append(smooth_y)
             
             if n==0:
-                all_y = np.hstack([smooth_y,current.reshape(-1,1)])
+                all_y = np.hstack([smooth_y])
             else:
-                _     = np.hstack([smooth_y,current.reshape(-1,1)])
+                _     = np.hstack([smooth_y])
                 all_y = np.hstack([all_y,_])
+       
+
+        self.global_mu  = np.nanmean( np.nanmean(all_y,0))
+        self.global_std = np.nanmean( np.nanstd(all_y,0))
+
+        #all_y = np.hstack([ all_y,  current.reshape(-1,1)])
+        all_y = (all_y - self.global_mu) / self.global_std
 
         tobs = []
         for target in y:
@@ -110,7 +118,7 @@ class puca( object ):
 
         self.all_y  = all_y 
         self.y      = y         #<--Target
-        self.Y      = smooth_ys #<--past Y values
+        self.Y      = [all_y] # smooth_ys #<--past Y values
         self.X      = X         #<--covariate information 
         
         return y, Y, X, all_y
@@ -125,165 +133,118 @@ class puca( object ):
               ,target_centers    = None
               ,target_scales     = None
               ,Ls                = None
+              ,IK                = None
               ,IL                = None
               ,Kp                = None 
               ,copies            = None
               ,tobs              = None
               ,target_indicators = None
+              ,Kmix              = 1
+               ,scales           = None
+               ,centers          = None   
               ,forecast          = None):
 
         #--We need to build F as a set of P-splines that are rperesented as B @ beta
-        T,K          = B.shape
-        S_past_total = y_past.shape[-1]
-        S            = S_past_total + 1
-        L            = IL.shape[0] 
+        Text,K          = B.shape
+        T               = y_past.shape[0] 
+        S_past_total    = y_past.shape[-1]
+        S               = S_past_total + 1
+        L               = IL.shape[0]
+
+        M=20
         
         #--This is a smoothness penalty 
-        meps       = 10**-5
-        smoothness_switch = numpyro.sample("smoothness_switch", dist.Exponential(1) )
-        tau_diff          = numpyro.sample("tau_diff", dist.HalfNormal(smoothness_switch))  # small => smooth (scale depends on your standardization!)
-        prec              = (Kp / (tau_diff**2)) + meps * jnp.eye(K)
+        meps       = 10**-3
+        tau_diff   = numpyro.sample("tau_diff"  , dist.HalfNormal(1))    #smoothness_switch))  # small => smooth (scale depends on your standardization!)
+        L_prec     = jnp.linalg.cholesky( (Kp / (tau_diff**2)) + meps * IK )
+
+        z_beta     = numpyro.sample("beta", dist.Normal(0,1).expand([K,L]) )
+        beta       = jsp_linalg.solve_triangular(L_prec, z_beta, lower=True)
+
+        b           = numpyro.sample("b", dist.Normal(0, 1.).expand([L]))   # (L,)
         
-        beta       = numpyro.sample("beta", dist.MultivariateNormal(0, precision_matrix = prec).expand([L]) )
-        beta       = beta.T    #<- K X L
-        beta       = Sb @ beta #<-- (B @ Sbinv) @ (Sb @ beta). In other words, normalize the columns of our B matrix
+        F_extended = B@beta
+        Fbase      = F_extended[M:M+T,:]
+        sF         = jnp.std(Fbase,0)                       #-- L We should normalize the columns of F should that X and y can share it
+        Fx         = Fbase/sF[None,:] + b
+        numpyro.deterministic("Fx",Fx)
+
+        shift_select = numpyro.sample("shift_select", dist.Categorical( jnp.ones(2*M+1)/(2*M+1) ).expand([L]) )
+        idx = jnp.arange(T, dtype=jnp.int32)[None, :] + shift_select[:, None]  # (L, T)
         
-        #--Lets assume that the F columns (it the latent time series) are correlated
-        F          = B@beta                             #--(T,K) @ (K,L) -> T X L
-        sF         = jnp.std(F,0)                       #-- L We should normalize the columns of F should that X and y can share it
-        Fnorm      = F/sF[None,:] 
+        #idx          = jnp.arange(T, dtype=jnp.int32) + shift_select
+        #F_select     = jnp.take(F_extended, idx, axis=0)
+        F_select = jnp.take_along_axis(F_extended.T, idx, axis=1).T  # (T, L)
         
-        #--discrepanacyes
-        global_scale = numpyro.sample("global_scale", dist.HalfNormal(0.5 * jnp.sqrt(jnp.pi/2)  ))
-        local_scale  = numpyro.sample("local_scale" , dist.HalfNormal(1.).expand([L]))
-
-        start_z = numpyro.sample("start_scale", dist.Normal(0,1).expand([S,1,L]) )
-        innov_z = numpyro.sample("innov_scale", dist.Normal(0,1).expand([S,T-1,L])) #<--one for P and one for Q
-
-        innovations =  (global_scale*local_scale)[None,None,:] * jnp.hstack([ innov_z[:, ::-1,:], start_z]) #<-- 2,T,L
-
-        d_paths       = jnp.cumsum(innovations,1)[:,::-1,:] #<--this is  S X T X L
-        numpyro.deterministic("d_paths", d_paths)
-
-        b     = numpyro.sample("rw_center", dist.Normal(0, 1.).expand([L]))   # (L,)
-        Fnorm = Fnorm + b + d_paths # T X L
-        Fx    = Fnorm[:-1,...] 
-        Fy    = Fnorm[-1,...]
-
-        # Fx = Fnorm
-        # Fy = Fnorm + y_path 
-        # Fy = Fnorm + b[None,:] + y_path_centered #--yes path here just bc its easier to forecast
-
-        numpyro.deterministic("Fnorm",Fnorm)
+        Fy        = F_select/sF[None,:] + b
+        numpyro.deterministic("Fy",Fy)
         
         #--P matrix so that X = Fnorm @ P
         tau_P     = numpyro.sample("tau_P"   , dist.HalfNormal(1.0))
-        lambda_P  = numpyro.sample("lambda_P", dist.HalfCauchy(1.0).expand([L,1]))
+        lambda_P  = numpyro.sample("lambda_P", dist.HalfNormal(1.0).expand([L,1]))
 
         P_blk_raw = numpyro.sample("P_blk_raw", dist.Normal(0,1).expand([L,L]))
         P_blk     = jnp.tril(P_blk_raw, k=-1) + IL
-
         P_blk     = P_blk * tau_P * lambda_P  
 
-        P_rest    = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S-1 - L]))
-
-        P         = jnp.concatenate([P_rest, P_blk], axis=1)
-        P         = P * sF[:,None]
-
-        Q         = numpyro.sample("Qraw", dist.Normal(0,1).expand([L,1])  )
-        Q         = Q * sF[:,None] 
+        P_rest    = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S -1 - L]))
         
-        numpyro.deterministic("P", P)
+        P         = jnp.concatenate([P_rest, P_blk], axis=1)
+        P         = numpyro.deterministic("P", P)# * sF[:,None])
+        
+        Qraw      = numpyro.sample("Qraw", dist.Normal(0,1).expand([L,1])  )
+        Q_scales  = numpyro.sample("Q_scales", dist.HalfNormal(1).expand([L,1]))
+        Q         = Q_scales*Qraw
         numpyro.deterministic("Q", Q)
+        
+        #--pbsevration space
+        global_scale      = numpyro.sample("global_scale", dist.HalfNormal(1 * jnp.sqrt(jnp.pi/2)  ))
+        local_scale       = numpyro.sample("local_scale" , dist.HalfNormal(1./2).expand([S]))
 
-        X            = jnp.einsum("stl,sl->st",Fx,P.T).T  #- S X T X L  and L X S -> T X S  P is LXS
-        eps          = 1./4#numpyro.sample("eps_x", dist.HalfNormal( (1./4)*jnp.sqrt(jnp.pi/2) )  )  
+        #log_global_scale = numpyro.sample("log_global_scale", dist.Normal(0, 1))
+        #global_scale = jnp.exp( log_global_scale - 2)
+        #numpyro.deterministic("global_scale", global_scale)
+
+        #log_local_scale = numpyro.sample("log_local_scale", dist.Normal(0, 1).expand([S]))
+        #local_scale = jnp.exp(log_local_scale - 0.5)
+        #numpyro.deterministic("local_scale", local_scale)
+
+
+        #start_scale       = numpyro.sample("start_scale", dist.HalfNormal(1./5)) 
+        start_z           = jnp.zeros((S,1))#numpyro.sample("start_z", dist.Normal(0,1).expand([S,1]) )
+        innov_z           = numpyro.sample("innov_scale", dist.Normal(0,1).expand([S,T-1])) #<--one for P and one for Q
+
+        innovations       =  jnp.hstack([ (global_scale*local_scale)[:,None]*innov_z, start_z]) #<-- S,T
+       
+        paths             =  jnp.cumsum(innovations[:,::-1],1)[:,::-1] #<--this is  S X T
+        numpyro.deterministic("paths", paths)
+
+        X            = (Fx@P).T 
+        X            = (X + paths[:-1,:]).T
 
         X_target   = jnp.hstack(y_past).reshape(T,S_past_total)
         present    = jnp.isfinite(X_target)
 
         maskX  = jnp.isfinite(X_target)
         X_fill = jnp.where(maskX, X_target, 0.0)
-        
+
+        #log_eps          = numpyro.sample( "eps", dist.Normal(0,1) ) # 1./5
+        #log_eps =  numpyro.sample("log_eps", dist.Normal(0,jnp.log(2)/2) )#  (1./10)   #jnp.exp( -jnp.log(10) + log_eps*jnp.log(2/2) )
+        #eps     = jnp.exp(log_eps-1)
+
+        eps = 0.05
         with numpyro.handlers.mask(mask=maskX):
             numpyro.sample("X_ll", dist.Normal(X, eps), obs=X_fill)
-
-        #--center and scale for y
-        Kmix = 2
-        centers, scales = [],[]
-        for signal, (cents, scals) in enumerate( zip(target_centers, target_scales) ):
-            N           = len(cents)
-            log_scals   = jnp.log(1+scals)
-
-            mu_cents    = jnp.mean(cents)
-            sigma_cents = jnp.std(cents) 
-            zc          = ((cents - mu_cents) / sigma_cents) .reshape(-1,1)
-
-            mu_scals    = jnp.mean(log_scals)
-            sigma_scals = jnp.std(log_scals)
-            zs = ((log_scals - mu_scals)/ sigma_scals).reshape(-1,1)
-
-            cs_vec = jnp.hstack([zc,zs])
-
-            # --- Bayesian Gaussian mixture in z-space -----------------------------
-            # weights
-            pi = numpyro.sample(f"pi_{signal}", dist.Dirichlet((1./Kmix)*jnp.ones(Kmix)))
-
-            # component means (in z-space)
-            mu_k = numpyro.sample(
-                f"mu_k_{signal}",
-                dist.Normal(0.0, 1.5).expand([Kmix, 2])
-            )
-
-            # component covariance via (scales * LKJ correlation)
-            # per-component marginal scales
-            sigma_k = numpyro.sample(
-                f"sigma_k_{signal}",
-                dist.HalfNormal(1.0).expand([Kmix, 2])
-            )
-            # per-component correlation Cholesky
-            Lcorr_k = numpyro.sample(
-                f"Lcorr_k_{signal}",
-                dist.LKJCholesky(dimension=2, concentration=2.0).expand([Kmix])
-            )  # (Kmix, 2, 2)
-
-            D_k = jax.vmap(jnp.diag)(sigma_k)                      # (Kmix, 2, 2)
-            L_k = jax.vmap(lambda D, L: D @ L)(D_k, Lcorr_k)       # (Kmix, 2, 2) scale_tril
-
-            comp = dist.MultivariateNormal(loc=mu_k, scale_tril=L_k)  # batch (Kmix,), event (2,)
-            mix  = dist.MixtureSameFamily(dist.Categorical(probs=pi), comp)
-
-            numpyro.sample(f"cs_obs_{signal}", mix.expand([N]), obs=cs_vec)
-
-            choice = numpyro.sample(f"choice_{signal}", mix)  # shape (2,)
-            center_choice_z, scal_choice_z = choice[0], choice[1]
-
-            #map back to natural scale
-            center_choice = center_choice_z * sigma_cents + mu_cents
-            scal_choice   = jnp.expm1(scal_choice_z * sigma_scals + mu_scals)
-
-            # corr   = (cs_vec.T@cs_vec) / (N-1)
-            # Lcov   = jnp.linalg.cholesky(corr)
-
-            # center_choice, scal_choice = numpyro.sample(f"choice_{signal}", dist.MultivariateStudentT(N-2, 0,Lcov) )
-
-            # center_choice = center_choice*sigma_cents + mu_cents
-            # scal_choice   = jnp.exp(scal_choice*sigma_scals + mu_scals)-1
-
-            centers.append(center_choice)
-            scales.append(scal_choice)
-        
-        centers = jnp.hstack(centers)
-        scales  = jnp.hstack(scales) 
-
+       
         y = (Fy@Q).reshape(T,1)
         numpyro.deterministic("y",y)
 
-        yhat_    = (y*scales.reshape(-1,1)) + centers.reshape(-1,1)
-        numpyro.deterministic("yhat_", yhat_)
+        y = y+paths[-1,:][:,None]
         
-        eps_y0 = eps                      
-        eps_y  = eps_y0 * scales
+        yhat_    = (y*scales) + centers
+        numpyro.deterministic("yhat_", yhat_)
+
+        eps_y  = (eps) * scales
 
         y_target = jnp.hstack(y_target).reshape(T,1)
         
@@ -291,22 +252,203 @@ class puca( object ):
         y_obs    = jnp.where(mask, y_target, 0.0)
 
         numpyro.deterministic("y_target", y_target)
-
-        print(yhat_.shape)
-        print(y_obs.shape)
-       
         with numpyro.handlers.mask(mask=mask):
             numpyro.sample("y_ll", dist.Normal(yhat_.reshape(T,1), eps_y), obs = y_obs.reshape(T,1))
 
         if forecast:
+            y_old_innovations = innov_z[-1,:]  #1,T-1
+            y_old_innovations = y_old_innovations[:tobs]
+
+            y_new_innovations = numpyro.sample("new_y_innov_scale"  , dist.Normal(0,1).expand([T-tobs-1 ,1]))
+
+            this_local_scale  = local_scale[-1]
+            innovations       = jnp.vstack([ (global_scale*this_local_scale)* y_old_innovations[:,None], (global_scale*this_local_scale)*y_new_innovations, start_z[-1][None,:] ]) #<-- T,1
+            reverse_path      = jnp.cumsum(innovations[::-1,:], axis=0)[::-1,:]
+
+            new_paths = reverse_path
+            y         = (Fy@Q).reshape(T,1) + new_paths
+
+           
+            yhat_    = jnp.clip( y*scales + centers, 0, None)
             numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
+
+
+
+        # def shift_zero_int(x, s):
+        #     """
+        #     x: (T,) or (T,L)
+        #     s: integer (can be traced)
+        #     positive s shifts RIGHT (later)
+        #     """
+        #     T = x.shape[0]
+        #     y = jnp.roll(x, s, axis=0)
+        #     idx = jnp.arange(T)
+
+        #     def pos(_):
+        #         m = (idx >= s)
+        #         m = m.reshape((T,) + (1,)*(x.ndim-1))
+        #         return y * m
+
+        #     def neg(_):
+        #         m = (idx < T + s)   # since s is negative
+        #         m = m.reshape((T,) + (1,)*(x.ndim-1))
+        #         return y * m
+
+        #     return jax.lax.cond(s >= 0, pos, neg, operand=None)
+
+        # def shift_zero_continuous(x, delta):
+        #     k = jnp.floor(delta).astype(jnp.int32)
+        #     a = delta - jnp.floor(delta)
+        #     x0 = shift_zero_int(x, k)
+        #     x1 = shift_zero_int(x, k + 1)
+        #     return (1.0 - a) * x0 + a * x1
+
+        # def sample_shifted(F_ext, delta, M):
+        #     """
+        #     F_ext: (Text, L)
+        #     delta: scalar float (can be traced)
+        #     Returns F_shift: (T, L) using linear interpolation
+        #     """
+        #     T   = F_ext.shape[0] - 2*M
+        #     pos = jnp.arange(T) + M - delta          # positions in F_ext
+        #     i0  = jnp.floor(pos).astype(jnp.int32)
+        #     a   = pos - jnp.floor(pos)
+
+        #     f0 = F_ext[i0, :]
+        #     f1 = F_ext[i0 + 1, :]
+        #     return (1.0 - a)[:, None] * f0 + a[:, None] * f1
+
+        # def sample_shifted_1d(f_ext, delta, M, T):
+        #     """
+        #     f_ext: (Text,) where Text = T + 2*M
+        #     delta: scalar shift (float). Positive shifts RIGHT (later).
+        #     returns: (T,)
+        #     """
+        #     Text = f_ext.shape[0]
+
+        #     # positions in f_ext we want to sample
+        #     pos = jnp.arange(T) + M - delta
+        #     i0  = jnp.floor(pos).astype(jnp.int32)
+        #     a   = pos - jnp.floor(pos)
+
+        #     # keep i0 in-bounds so i0+1 is valid
+        #     i0 = jnp.clip(i0, 0, Text - 2)
+
+        #     f0 = jnp.take(f_ext, i0)
+        #     f1 = jnp.take(f_ext, i0 + 1)
+        #     return (1.0 - a) * f0 + a * f1
+
+
+
+        #delta     = numpyro.sample("delta_fixed", dist.Uniform(-20+1,20-1)  )
+        #Fshifted  = sample_shifted(F_extended, delta, M)   #jax.vmap(lambda fcol, d: sample_shifted_1d(fcol, d, 20,T),in_axes=(1, 0), out_axes=1)( F_extended  , deltas)
+ 
+
+        #F = shift_zero_continuous( B @ beta, delta_fixed)
+        
+        #F = B @ beta #<< This is Tpadded X L
+
+        # delta = numpyro.sample("delta", dist.Uniform(-M+1., M-1.))  # keep within support
+        # F = sample_shifted(F, delta, M)         # (T, L)
+
+        
+        #beta         = Sb @ beta #<-- (B @ Sbinv) @ (Sb @ beta). In other words, normalize the columns of our B matrix
+        
+        #--Lets assume that the F columns (it the latent time series) are correlated
+        #F          = B@beta                             #--(T,K) @ (K,L) -> T X L
+        #Fnorm      = F/sF[None,:] 
+ 
+
+        #--center and scale for y
+        #Kmix = 2
+        # centers, scales = [],[]
+        # for signal, (cents, scals) in enumerate( zip(target_centers, target_scales) ):
+        #     N           = len(cents)
+        #     log_scals   = jnp.log(1+scals)
+
+        #     mu_cents    = jnp.mean(cents)
+        #     sigma_cents = jnp.std(cents) 
+        #     zc          = ((cents - mu_cents) / sigma_cents) .reshape(-1,1)
+
+        #     mu_scals    = jnp.mean(log_scals)
+        #     sigma_scals = jnp.std(log_scals)
+        #     zs = ((log_scals - mu_scals)/ sigma_scals).reshape(-1,1)
+
+        #     cs_vec = jnp.hstack([zc,zs])
+
+        #     # --- Bayesian Gaussian mixture in z-space -----------------------------
+        #     # weights
+        #     pi = numpyro.sample(f"pi_{signal}", dist.Dirichlet((1./Kmix)*jnp.ones(Kmix)))
+
+        #     # component means (in z-space)
+        #     mu_k = numpyro.sample(
+        #         f"mu_k_{signal}",
+        #         dist.Normal(0.0, 1.5).expand([Kmix, 2])
+        #     )
+
+        #     # component covariance via (scales * LKJ correlation)
+        #     # per-component marginal scales
+        #     sigma_k = numpyro.sample(
+        #         f"sigma_k_{signal}",
+        #         dist.HalfNormal(1.0).expand([Kmix, 2])
+        #     )
+        #     # per-component correlation Cholesky
+        #     Lcorr_k = numpyro.sample(
+        #         f"Lcorr_k_{signal}",
+        #         dist.LKJCholesky(dimension=2, concentration=2.0).expand([Kmix])
+        #     )  # (Kmix, 2, 2)
+
+        #     D_k = jax.vmap(jnp.diag)(sigma_k)                      # (Kmix, 2, 2)
+        #     L_k = jax.vmap(lambda D, L: D @ L)(D_k, Lcorr_k)       # (Kmix, 2, 2) scale_tril
+
+        #     comp = dist.MultivariateNormal(loc=mu_k, scale_tril=L_k)  # batch (Kmix,), event (2,)
+        #     mix  = dist.MixtureSameFamily(dist.Categorical(probs=pi), comp)
+
+        #     numpyro.sample(f"cs_obs_{signal}", mix.expand([N]), obs=cs_vec)
+
+        #     choice = numpyro.sample(f"choice_{signal}", mix)  # shape (2,)
+        #     center_choice_z, scal_choice_z = choice[0], choice[1]
+
+        #     #map back to natural scale
+        #     center_choice = center_choice_z * sigma_cents + mu_cents
+        #     scal_choice   = jnp.expm1(scal_choice_z * sigma_scals + mu_scals)
+
+        #     centers.append(center_choice)
+        #     scales.append(scal_choice)
+        
+        # centers = jnp.hstack(centers)
+        # #scales  = jnp.hstack(scales) 
+
+
+
+
+        # y_paths = paths[-1,:][:,None]
+        # shifts  = jnp.arange(0,2*M+1)
+
+        # def compute_LL_for_shift(shift, y_paths, present):
+        #     idx     = jnp.arange(T, dtype=jnp.int32) + shift
+        #     #F_      = jnp.take(F_extended , idx , axis=0 )
+        #     F_      = jax.lax.dynamic_slice(F_extended, (shift, 0), (T, F_extended.shape[1]))
+
+        #     mu        = (F_/sF[None,:] + b)@Q + y_paths
+        #     mu_scaled = mu*scales + centers 
+            
+        #     loglike = dist.Normal( mu_scaled , eps_y ).log_prob( y_obs )
+        #     return jnp.sum(jnp.where(present, loglike, 0.0))  
+        # all_LLS = jax.vmap( lambda x: compute_LL_for_shift(x,y_paths,mask) )( shifts  )
+
+        # LLy = 0.5*jax.scipy.special.logsumexp( all_LLS/ (0.5) ) - jnp.log( shifts.size )
+        # numpyro.factor("LLy",LLy)
+
+        #numpyro.deterministic("Fy",Fy)
+
 
 
         # # #--sample this for y so that its not annoying in predcition
         # start_z = numpyro.sample("start_scale", dist.Normal(0,1).expand([1,L]) )
         # innov_z = numpyro.sample("innov_scale", dist.Normal(0,1).expand([T-1,L])) #<--one for P and one for Q
 
-        # innovations =  (global_scale*local_scale).reshape(1,L) * jnp.vstack([ innov_z[::-1,:], start_z]) 
+    # innovations =  (global_scale*local_scale).reshape(1,L) * jnp.vstack([ innov_z[::-1,:], start_z]) 
 
         # y_path       = jnp.cumsum(innovations,0)[::-1,:] #<--this is  T X L
         # numpyro.deterministic("y_path", y_path)
@@ -516,16 +658,18 @@ class puca( object ):
         return estimated_factors_D, (u,s,vt)
 
     def fit(self
-            , estimate_lmax_x = True
-            , estimate_lmax_y = True
-            , run_SVI         = True
-            , use_anchor      = False):
+            , estimated_lmax_x = True
+            , estimated_lmax_y = None
+            , Kmix             = 1
+            , run_SVI          = True
+            , use_anchor       = False):
 
         y, Y, X     = self.y, self.Y, self.X
         all_y       = self.all_y
+        self.Kmix = Kmix
 
         #--SVD for X
-        if estimate_lmax_y:
+        if estimated_lmax_y is None:
             Ls, us, vts, lambdas = [],[],[], []
             for _ in Y:
                 nfactors, (u,s,vt) = self.estimate_factors(_)
@@ -538,6 +682,8 @@ class puca( object ):
             self.us                  = us
             self.lambdas             = lambdas 
             self.vts                 = vts
+        else:
+            self.estimated_factors_y = estimated_lmax_y
 
         from patsy import dmatrix
 
@@ -561,15 +707,25 @@ class puca( object ):
                 B[ok] = B_ok
             return B
 
+        def bs_basis_numpy(tvals, knots, lb, ub):
+            return np.asarray(
+                dmatrix(
+                    "bs(t, knots=knots, degree=3, include_intercept=True, "
+                    "lower_bound=lb, upper_bound=ub) - 1",
+                    {"t": np.asarray(tvals, float), "knots": knots, "lb": lb, "ub": ub},
+                )
+            )
+
+
         # time grid
         T = self.T
-        t = jnp.arange(T) #<--move one time unit back
 
         # choose fixed spline settings
-        lb, ub = 0, T-1
-        knots  = np.arange(lb,ub,2)[1:]#-1]
+        lb, ub = -20, (T-1) + 20
+        t      = np.arange(lb,ub+1)
+        knots  = np.arange(lb, ub, 2)[1:]
         
-        B            = bs_basis_zero_padded(t)
+        B            = bs_basis_numpy(t,knots,lb,ub)
         self.B       = B
 
         D            = jnp.std(B, 0) 
@@ -583,8 +739,8 @@ class puca( object ):
         Kp         = D.T@D
         self.Kp    = Kp
         
-        model        = self.model
-        copies = self.copies
+        model      = self.model
+        copies     = self.copies
         
         #--collect helpful parameters
         S_past_total      = int(sum(copies))
@@ -597,21 +753,50 @@ class puca( object ):
         target_indicators           = starts + copies_j
         self.target_indicators_mcmc = target_indicators
 
-        IL                = np.eye( int(sum(self.estimated_factors_y)))
+        IL                = jnp.eye( int(sum(self.estimated_factors_y)))
         self.IL           = IL
+
+        IK                 = jnp.eye(B_norm.shape[1])
+        self.IK           = IK
         
         rng_post          = jax.random.PRNGKey(100915)
         num_draws         = 5*10**3
-        
-        nuts_kernel = NUTS(self.model, init_strategy = init_to_median(num_samples=100)) 
-        mcmc = MCMC(nuts_kernel
-                    , num_warmup     = 2000
-                    , num_samples    = 4000
-                    , num_chains     = 1
-                    , jit_model_args = True)
 
+        print("4")
+
+        dense_blocks = [
+            ("beta", "tau_diff","b"),                          # spline shape + smoothness + level
+            ("P_blk_raw", "P_rest", "tau_P", "lambda_P"),       # P hierarchy
+            ("Qraw", "Q_scales"),                               # target loading
+            ("global_scale", "local_scale"),     # RW scales (optionally add "start_z")
+            # optionally:
+            # ("innov_scale", "start_z")                        # only if S*(T-1) is not too big
+        ]
+        # for s in range(num_targets):
+        #     dense_blocks.append( (f"pi_{s}",f"mu_k_{s}",f"sigma_k_{s}",f"Lcorr_k_{s}",f"choice_{s}") )
+        
+        nuts_kernel = NUTS(self.model, init_strategy = init_to_median(num_samples=100) , dense_mass = dense_blocks)        #, dense_mass =   [("innov_scale",), ("Lcorr_k_0",), ("beta",), ("P_rest",)] )
+        kernel      = DiscreteHMCGibbs(nuts_kernel)
+        mcmc        = MCMC(kernel
+                    , num_warmup     = 3000
+                    , num_samples    = 3500
+                    , num_chains     = 1
+                    , jit_model_args = False)
+
+
+
+        if X is not None:
+           y_past = np.hstack([ X, Y[0] ])
+           target_indicators = [target_indicators[0]+X.shape[-1]]
+           self.target_indicators_mcmc = target_indicators
+        else:
+            y_past = Y[0]
+        self.y_past = y_past
+
+        print(self.tobs)
+        
         mcmc.run(jax.random.PRNGKey(20200320)
-                              ,y_past            = Y[0]
+                              ,y_past            = y_past
                               ,y_target          = y
                               ,B                 = B_norm
                               ,Sb                = Sb
@@ -619,43 +804,48 @@ class puca( object ):
                               ,target_scales     = self.y_scales
                               ,Ls                = self.estimated_factors_y
                               ,IL                = IL
+                              ,IK                = IK
                               ,Kp                = Kp
                               ,copies            = self.copies
-                              ,tobs              = self.tobs
-                              ,target_indicators = target_indicators 
-                              ,forecast          = None 
-                              ,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy"))
+                              ,tobs              = self.tobs[0]
+                              ,target_indicators = target_indicators
+                              , scales = self.global_std
+                              ,centers = self.global_mu
+                              , Kmix             = self.Kmix 
+                              ,forecast          = None )
+                              #,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy"))
 
+        self.mcmc = mcmc
         mcmc.print_summary()
         samples = mcmc.get_samples()
         self.posterior_samples = samples
 
         #--diagnostics
-        extra = mcmc.get_extra_fields()
+        # extra = mcmc.get_extra_fields()
 
-        print("divergences:", int(extra["diverging"].sum()))
+        # print("divergences:", int(extra["diverging"].sum()))
 
-        steps = np.asarray(extra["num_steps"])
-        print("num_steps median / 90% / max:", np.median(steps), np.quantile(steps, 0.9), steps.max())
+        # steps = np.asarray(extra["num_steps"])
+        # print("num_steps median / 90% / max:", np.median(steps), np.quantile(steps, 0.9), steps.max())
 
-        acc = np.asarray(extra["accept_prob"])
-        print("accept_prob mean:", acc.mean(), "min:", acc.min(), "max:", acc.max())
+        # acc = np.asarray(extra["accept_prob"])
+        # print("accept_prob mean:", acc.mean(), "min:", acc.min(), "max:", acc.max())
 
-        # Step size (after adaptation)
-        print("step_size:", float(mcmc.last_state.adapt_state.step_size))
+        # # Step size (after adaptation)
+        # print("step_size:", float(mcmc.last_state.adapt_state.step_size))
 
-        if "energy" in extra:
-            E = np.asarray(extra["energy"])
-            ebfmi = np.mean(np.diff(E)**2) / np.var(E)
-            print("E-BFMI:", ebfmi)  # rule of thumb: < 0.3 is concerning
+        # if "energy" in extra:
+        #     E = np.asarray(extra["energy"])
+        #     ebfmi = np.mean(np.diff(E)**2) / np.var(E)
+        #     print("E-BFMI:", ebfmi)  # rule of thumb: < 0.3 is concerning
 
-        div_idx = np.where(np.asarray(extra["diverging"]))[0]
-        print("divergent draws:", div_idx[:20], "count:", len(div_idx))
+        # div_idx = np.where(np.asarray(extra["diverging"]))[0]
+        # print("divergent draws:", div_idx[:20], "count:", len(div_idx))
 
-        for name in ["A_logit_0", "Q_diags", "global_sigma_rw", "global_f_sigma"]:
-            if name in samples:
-                vals = np.asarray(samples[name])
-                print(name, "divergent mean:", vals[div_idx].mean(), "overall mean:", vals.mean())
+        # for name in ["A_logit_0", "Q_diags", "global_sigma_rw", "global_f_sigma"]:
+        #     if name in samples:
+        #         vals = np.asarray(samples[name])
+        #         print(name, "divergent mean:", vals[div_idx].mean(), "overall mean:", vals.mean())
 
         return self
 
@@ -666,7 +856,7 @@ class puca( object ):
 
         rng_key    = jax.random.PRNGKey(100915)
         pred_samples = predictive( rng_key
-                              ,y_past            = self.Y[0]
+                              ,y_past            = self.y_past
                               ,y_target          = self.y
                               ,B                 = self.B_norm
                               ,Sb                = self.Sb
@@ -674,10 +864,14 @@ class puca( object ):
                               ,target_scales     = self.y_scales
                               ,Ls                = self.estimated_factors_y
                               ,IL                = self.IL
+                              ,IK                = self.IK
                               ,Kp                = self.Kp
                               ,copies            = self.copies
-                              ,tobs              = self.tobs
+                              ,tobs              = self.tobs[0]
                               ,target_indicators = self.target_indicators_mcmc
+                              , scales = self.global_std
+                              , centers = self.global_mu
+                              , Kmix             = self.Kmix 
                               ,forecast          = True
                                   )
         yhat_draws = pred_samples["y_pred"]      # (draws, T, S)
