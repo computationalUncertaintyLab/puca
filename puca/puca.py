@@ -132,16 +132,19 @@ class puca( object ):
               ,Sb                = None
               ,target_centers    = None
               ,target_scales     = None
+               ,column_shifts    = None
               ,Ls                = None
               ,IK                = None
               ,IL                = None
-              ,Kp                = None 
+              ,Kp                = None
+              ,Kp_U              = None
+              ,Kp_l              = None
               ,copies            = None
               ,tobs              = None
               ,target_indicators = None
               ,Kmix              = 1
-               ,scales           = None
-               ,centers          = None   
+              ,scales           = None
+              ,centers          = None   
               ,forecast          = None):
 
         #--We need to build F as a set of P-splines that are rperesented as B @ beta
@@ -151,76 +154,117 @@ class puca( object ):
         S               = S_past_total + 1
         L               = IL.shape[0]
 
-        M=20
+        M               = 10
         
         #--This is a smoothness penalty 
         meps       = 10**-3
-        tau_diff   = numpyro.sample("tau_diff"  , dist.HalfNormal(1))    #smoothness_switch))  # small => smooth (scale depends on your standardization!)
-        L_prec     = jnp.linalg.cholesky( (Kp / (tau_diff**2)) + meps * IK )
+        #tau_diff   = numpyro.sample("tau_diff"  , dist.HalfNormal(1))        #-- small => smooth (scale depends on your standardization!)
 
-        z_beta     = numpyro.sample("beta", dist.Normal(0,1).expand([K,L]) )
-        beta       = jsp_linalg.solve_triangular(L_prec, z_beta, lower=True)
-
-        b           = numpyro.sample("b", dist.Normal(0, 1.).expand([L]))   # (L,)
+        log_tau_diff = numpyro.sample("log_tau_diff", dist.Normal(0, 1).expand([L]) )
+        tau_diff     = jnp.exp( log_tau_diff*jnp.log(1/2) + jnp.log(0.05))
         
-        F_extended = B@beta
-        Fbase      = F_extended[M:M+T,:]
-        sF         = jnp.std(Fbase,0)                       #-- L We should normalize the columns of F should that X and y can share it
-        Fx         = Fbase/sF[None,:] + b
+        z_beta       = numpyro.sample("beta", dist.Normal(0,1).expand([K,L]) )
+
+        def produce_beta( tau_diff, z_beta ):
+            on_diag    = (Kp_l/tau_diff**2) + meps #<-KXL
+            L_prec_inv = Kp_U @ ( jnp.diag(1./ jnp.sqrt(on_diag))  ) #@ Kp_U.T
+            beta       = L_prec_inv@z_beta
+            return beta
+        beta = jax.vmap( produce_beta, in_axes = (0,1) )( tau_diff, z_beta  )
+        beta = beta.T
+
+        b          = numpyro.sample("b", dist.Normal(0, 1.).expand([L]))   # (L,)
+
+        base        = jnp.arange(T)
+        B_0         = B[M+base,:]
+        
+        Fy          = B_0 @ beta #<--y is alwyas the reference
+        sFy         = numpyro.deterministic( "sFy", jnp.std(Fy,0) ) #jnp.ones( (L,))
+        mFy         = jnp.mean(Fy, axis=0)
+
+        B_shifted   = B[ (M+base)[:,None] - column_shifts[None,:]  ]
+        Fx          = B_shifted @ beta              #<--T X S X L
+        
+        sFx         = numpyro.deterministic( "sFx", jnp.std(Fx,0) ) #jnp.ones( (L,))
+        mFx         = jnp.mean(Fx, axis=0)
+
+        Fx          = Fx+ b[None,None,:] #(Fx - mFy)  /sFy[None,:] 
+        Fy          = Fy+ b[None,:]#(Fy - mFy)  /sFy[None,:] 
+
         numpyro.deterministic("Fx",Fx)
-
-        shift_select = numpyro.sample("shift_select", dist.Categorical( jnp.ones(2*M+1)/(2*M+1) ).expand([L]) )
-        idx = jnp.arange(T, dtype=jnp.int32)[None, :] + shift_select[:, None]  # (L, T)
-        
-        #idx          = jnp.arange(T, dtype=jnp.int32) + shift_select
-        #F_select     = jnp.take(F_extended, idx, axis=0)
-        F_select = jnp.take_along_axis(F_extended.T, idx, axis=1).T  # (T, L)
-        
-        Fy        = F_select/sF[None,:] + b
         numpyro.deterministic("Fy",Fy)
-        
+       
         #--P matrix so that X = Fnorm @ P
         tau_P     = numpyro.sample("tau_P"   , dist.HalfNormal(1.0))
         lambda_P  = numpyro.sample("lambda_P", dist.HalfNormal(1.0).expand([L,1]))
+        lambda_P  = jnp.sort(lambda_P)[::-1]
 
-        P_blk_raw = numpyro.sample("P_blk_raw", dist.Normal(0,1).expand([L,L]))
-        P_blk     = jnp.tril(P_blk_raw, k=-1) + IL
-        P_blk     = P_blk * tau_P * lambda_P  
+        gScale    = (tau_P * lambda_P)
+        
+        r,c          = jnp.tril_indices(L,k=-1)
+        P_zeros      = jnp.zeros((L,L))
+        z_P_blk_raw  = numpyro.sample("z_P_blk_raw", dist.Normal(0,1).expand([ int(L*(L-1)/2) ] ))
+        P_blk        = gScale*( P_zeros.at[r,c].set(z_P_blk_raw) ) + IL  
 
-        P_rest    = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S -1 - L]))
-        
-        P         = jnp.concatenate([P_rest, P_blk], axis=1)
-        P         = numpyro.deterministic("P", P)# * sF[:,None])
-        
-        Qraw      = numpyro.sample("Qraw", dist.Normal(0,1).expand([L,1])  )
-        Q_scales  = numpyro.sample("Q_scales", dist.HalfNormal(1).expand([L,1]))
-        Q         = Q_scales*Qraw
+        P_rest       = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S - 1 - L]))
+        P_rest       = gScale*P_rest
+        P            = jnp.concatenate([P_rest, P_blk], axis=1) #<--LXS
+
+        log_Q_scales = numpyro.sample("Q_scales", dist.Normal(0,1).expand([L,1]))
+        Q_scales     = jnp.exp(log_Q_scales*jnp.log(2)/2 - 1) 
+        Qraw         = numpyro.sample("Qraw"    , dist.Normal(0,1).expand([L,1])  )
+        Q            = Q_scales*Qraw
         numpyro.deterministic("Q", Q)
-        
-        #--pbsevration space
-        global_scale      = numpyro.sample("global_scale", dist.HalfNormal(1 * jnp.sqrt(jnp.pi/2)  ))
-        local_scale       = numpyro.sample("local_scale" , dist.HalfNormal(1./2).expand([S]))
 
-        #log_global_scale = numpyro.sample("log_global_scale", dist.Normal(0, 1))
-        #global_scale = jnp.exp( log_global_scale - 2)
-        #numpyro.deterministic("global_scale", global_scale)
+        #--compute trends
+        Xtrend = jnp.einsum("tsl,ls->ts",Fx,P) #<-TXS
+        numpyro.deterministic("Xtrend",Xtrend)
+        
+        ytrend = (Fy@Q).reshape(T,1)
+        numpyro.deterministic("ytrend",ytrend)
+        
+        #--AR
+
+        
+        #log_global_scale = numpyro.sample("log_global_scale", dist.TruncatedNormal( 0,2, low=0.5  ) )
+        log_global_scale = numpyro.sample("log_global_scale", dist.Gamma( 2, 1./2  ) )
+        global_scale     = 1./jnp.sqrt(log_global_scale)
+        numpyro.deterministic("global_scale", global_scale)
 
         #log_local_scale = numpyro.sample("log_local_scale", dist.Normal(0, 1).expand([S]))
-        #local_scale = jnp.exp(log_local_scale - 0.5)
-        #numpyro.deterministic("local_scale", local_scale)
+        #local_scale     = jnp.exp(log_local_scale*jnp.log(4)/2 - 0)
 
+        #a  = numpyro.sample("a", dist.Gamma(5, 1)  )
+        #bb = numpyro.sample("bb", dist.Gamma(1, 10) )
 
-        #start_scale       = numpyro.sample("start_scale", dist.HalfNormal(1./5)) 
-        start_z           = jnp.zeros((S,1))#numpyro.sample("start_z", dist.Normal(0,1).expand([S,1]) )
-        innov_z           = numpyro.sample("innov_scale", dist.Normal(0,1).expand([S,T-1])) #<--one for P and one for Q
+        #local_scale = numpyro.sample("log_local_scale", dist.Normal(0,1).expand([S]) )
+        local_scale = numpyro.sample("log_local_scale", dist.Gamma(2,2).expand([S]) )
+        local_scale = 1./jnp.sqrt(local_scale)
+        
+        path_scale  = global_scale*local_scale# jnp.exp( jnp.log(global_scale) + local_scale)
+        
+        numpyro.deterministic("local_scale", local_scale)
 
-        innovations       =  jnp.hstack([ (global_scale*local_scale)[:,None]*innov_z, start_z]) #<-- S,T
-       
-        paths             =  jnp.cumsum(innovations[:,::-1],1)[:,::-1] #<--this is  S X T
+        innov_z           = numpyro.sample("innov_z"    , dist.Normal(0,1).expand([S,T-1])) #<--one for P and one for Q
+
+        start_scale       = numpyro.sample("start_scale", dist.Gamma(2,2)) 
+        start_z           = numpyro.sample("start_z"    , dist.Normal(0,1).expand([S,1]) )
+        
+        start              = (1./start_scale)*start_z
+        innovations        = path_scale[:,None]*innov_z
+        phi_raw            = numpyro.sample("phi_raw", dist.Normal(0,1))
+        phi                = jax.nn.tanh(2+phi_raw*0.1) 
+ 
+        def step(x_next, z_t, phi):
+            x_t = 1 * (x_next) + z_t
+            return x_t, x_t
+        _, xs_rev = jax.lax.scan( lambda x,y: step(x,y,phi), init=start.squeeze(), xs=innovations.T )  # xs_rev is [x_{T-2}, x_{T-3}, ..., x_0]
+
+        paths = jnp.concatenate([jnp.flip(xs_rev, axis=0), start.T], axis=0)  # [x_0,...,x_{T-1}]  T X S
+
         numpyro.deterministic("paths", paths)
 
-        X            = (Fx@P).T 
-        X            = (X + paths[:-1,:]).T
+        X            = Xtrend + paths[:,:-1]
 
         X_target   = jnp.hstack(y_past).reshape(T,S_past_total)
         present    = jnp.isfinite(X_target)
@@ -228,18 +272,12 @@ class puca( object ):
         maskX  = jnp.isfinite(X_target)
         X_fill = jnp.where(maskX, X_target, 0.0)
 
-        #log_eps          = numpyro.sample( "eps", dist.Normal(0,1) ) # 1./5
-        #log_eps =  numpyro.sample("log_eps", dist.Normal(0,jnp.log(2)/2) )#  (1./10)   #jnp.exp( -jnp.log(10) + log_eps*jnp.log(2/2) )
-        #eps     = jnp.exp(log_eps-1)
-
         eps = 0.05
+       
         with numpyro.handlers.mask(mask=maskX):
             numpyro.sample("X_ll", dist.Normal(X, eps), obs=X_fill)
        
-        y = (Fy@Q).reshape(T,1)
-        numpyro.deterministic("y",y)
-
-        y = y+paths[-1,:][:,None]
+        y = ytrend+paths[:,-1][:,None]
         
         yhat_    = (y*scales) + centers
         numpyro.deterministic("yhat_", yhat_)
@@ -256,21 +294,309 @@ class puca( object ):
             numpyro.sample("y_ll", dist.Normal(yhat_.reshape(T,1), eps_y), obs = y_obs.reshape(T,1))
 
         if forecast:
-            y_old_innovations = innov_z[-1,:]  #1,T-1
-            y_old_innovations = y_old_innovations[:tobs]
+            innov_z           = numpyro.sample("new_innov_z"    , dist.Normal(0,1).expand([1,T-1])) #<--one for P and one for Q
+            #start              = jnp.zeros((1,1))
 
-            y_new_innovations = numpyro.sample("new_y_innov_scale"  , dist.Normal(0,1).expand([T-tobs-1 ,1]))
+            start              = start[-1].reshape(-1,1)
+            innovations        = (path_scale)[-1]*innov_z
+           
+            def step(x_next, z_t, phi):
+                x_t = 1 * (x_next) + z_t
+                return x_t, x_t
+            _, xs_rev = jax.lax.scan( lambda x,y: step(x,y,phi), init=start, xs=innovations.T )  # xs_rev is [x_{T-2}, x_{T-3}, ..., x_0]
 
-            this_local_scale  = local_scale[-1]
-            innovations       = jnp.vstack([ (global_scale*this_local_scale)* y_old_innovations[:,None], (global_scale*this_local_scale)*y_new_innovations, start_z[-1][None,:] ]) #<-- T,1
-            reverse_path      = jnp.cumsum(innovations[::-1,:], axis=0)[::-1,:]
+            xs_rev = xs_rev.reshape(T-1,1)
+            paths  = jnp.concatenate([jnp.flip(xs_rev, axis=0), start.T], axis=0)  # [x_0,...,x_{T-1}]  T X S
+            numpyro.deterministic("pred_paths", paths)
+            
+            yhat_ = (ytrend + paths)*scales + centers
+            
+            numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
 
-            new_paths = reverse_path
-            y         = (Fy@Q).reshape(T,1) + new_paths
+            #numpyro.sample("y_pred", dist.Poisson(yhat_))#, eps_y) )
+            
+            # y_old_innovations = innov_z[-1,:]  #1,T-1
+            # y_old_innovations = y_old_innovations[:tobs]
+
+            # y_new_innovations = numpyro.sample("new_y_innov_scale"  , dist.Normal(0,1).expand([T-tobs-1 ,1]))
+
+            # this_local_scale  = local_scale[-1]
+            # innovations       = jnp.vstack([ (global_scale*this_local_scale)* y_old_innovations[:,None], (global_scale*this_local_scale)*y_new_innovations, start_z[-1][None,:] ]) #<-- T,1
+            # reverse_path      = jnp.cumsum(innovations[::-1,:], axis=0)[::-1,:]
+
+            # new_paths = reverse_path
+            # y         = (Fy@Q).reshape(T,1) + new_paths
 
            
-            yhat_    = jnp.clip( y*scales + centers, 0, None)
-            numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
+            # yhat_    = jnp.clip( y*scales + centers, 0, None)
+            # numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
+        
+    def estimate_factors(self,D):
+        u, s, vt            = np.linalg.svd(D, full_matrices=False)
+        splain              = np.cumsum(s**2) / np.sum(s**2)
+        estimated_factors_D = (np.min(np.argwhere(splain > .95)) + 1)
+        return estimated_factors_D, (u,s,vt)
+
+
+    def find_best_alignment(self):
+        y, Y, X     = self.y, self.Y, self.X
+        y_past      = Y[0]
+        y_target    = (y- self.global_mu)/self.global_std
+
+        def apply_shift_1d(y, d, fill=np.nan):
+            """Return shifted series y_shifted[t] = y[t + d] (out of bounds -> fill)."""
+            T        = y.shape[0]
+            out      = np.full(T, fill, dtype=float)
+            t        = np.arange(T)
+            idx      = t + d
+            inb      = (idx >= 0) & (idx < T)
+            out[inb] = y[idx[inb]]
+            return out
+
+        column_shifts = []
+        for n,column in enumerate(y_past.T):
+            sses = []
+            for shift in np.arange(-10,10+1,1):
+                shifted_column = apply_shift_1d(column, shift)
+                sses.append( (np.nansum( (shifted_column - y_target)**2 ) , shift) )
+            best = sorted(sses)[0][-1]
+            column_shifts.append(best)
+        
+        return column_shifts
+
+    def fit(self
+            , estimated_lmax_x = True
+            , estimated_lmax_y = None
+            , Kmix             = 1
+            , run_SVI          = True
+            , use_anchor       = False):
+
+        y, Y, X     = self.y, self.Y, self.X
+        all_y       = self.all_y
+        self.Kmix = Kmix
+
+        column_shifts      = self.find_best_alignment()
+        self.column_shifts = jnp.array(column_shifts)
+
+        #--SVD for X
+        if estimated_lmax_y is None:
+            Ls, us, vts, lambdas = [],[],[], []
+            for _ in Y:
+                nfactors, (u,s,vt) = self.estimate_factors(_)
+                Ls.append(nfactors)
+                us.append(u)
+                lambdas.append(s)
+                vts.append(vt)
+                
+            self.estimated_factors_y = Ls
+            self.us                  = us
+            self.lambdas             = lambdas 
+            self.vts                 = vts
+        else:
+            self.estimated_factors_y = estimated_lmax_y
+
+        from patsy import dmatrix
+
+        def bs_basis_zero_padded(tvals):
+            def bs_basis(tvals):
+                return np.asarray(
+                    dmatrix(
+                        "bs(t, knots=knots, degree=3, include_intercept=True, "
+                        "lower_bound=lb, upper_bound=ub) - 1",
+                        {"t": tvals, "knots": knots, "lb": lb, "ub": ub},
+                    )
+                )
+            
+            tvals = np.asarray(tvals, float)
+            ok = (tvals >= lb) & (tvals <= ub)
+
+            # build basis for clipped values (any in-range values ok)
+            B = np.zeros((len(tvals), bs_basis(np.array([lb])).shape[1]), float)
+            if ok.any():
+                B_ok = bs_basis(tvals[ok])  # uses fixed knots/bounds
+                B[ok] = B_ok
+            return B
+
+        def bs_basis_numpy(tvals, knots, lb, ub):
+            return np.asarray(
+                dmatrix(
+                    "bs(t, knots=knots, degree=3, include_intercept=False, "
+                    "lower_bound=lb, upper_bound=ub) - 1",
+                    {"t": np.asarray(tvals, float), "knots": knots, "lb": lb, "ub": ub},
+                )
+            )
+
+
+        # time grid
+        T = self.T
+        M=10
+        
+        # choose fixed spline settings
+        lb, ub = -M, (T-1) + M
+        t      = np.arange(lb,ub+1)
+        knots  = np.arange(lb, ub, 2)[1:]
+        
+        B            = bs_basis_numpy(t,knots,lb,ub)
+        self.B       = B
+
+        D            = jnp.std(B, 0) 
+        Sb           = jnp.diag( D )
+        B_norm       = B@jnp.diag(1./D)
+
+        self.B_norm = B_norm
+        self.Sb     = Sb
+
+        D          = jnp.diff(jnp.diff(jnp.eye(B.shape[-1]),axis=0),axis=0)
+        Kp         = D.T@D
+
+        self.Kp                 = Kp
+        self.Kp_l, self.Kp_U    = jnp.linalg.eigh(Kp)
+        
+        model      = self.model
+        copies     = self.copies
+        
+        #--collect helpful parameters
+        S_past_total      = int(sum(copies))
+        num_targets       = len(copies)
+        S                 = S_past_total + num_targets
+
+        #--we will flateen target_indicators
+        copies_j                    = jnp.array(self.target_indicators)        
+        starts                      = jnp.concatenate([jnp.array([0]), jnp.cumsum(copies_j + 1)[:-1]])
+        target_indicators           = starts + copies_j
+        self.target_indicators_mcmc = target_indicators
+
+        IL                = jnp.eye( int(sum(self.estimated_factors_y)))
+        self.IL           = IL
+
+        IK                 = jnp.eye(B_norm.shape[1])
+        self.IK           = IK
+        
+        rng_post          = jax.random.PRNGKey(100915)
+        num_draws         = 5*10**3
+
+        dense_blocks = [
+            ("beta", "log_tau_diff","b"),                          # spline shape + smoothness + level
+            ("z_P_blk_raw", "P_rest", "tau_P", "lambda_P"),       # P hierarchy
+            ("Qraw", "Q_scales"),                               # target loading
+            ("log_global_scale", "log_local_scale","phi_raw"),     # RW scales (optionally add "start_z")
+            # optionally:
+            # ("innov_scale", "start_z")                        # only if S*(T-1) is not too big
+        ]
+        # for s in range(num_targets):
+        #     dense_blocks.append( (f"pi_{s}",f"mu_k_{s}",f"sigma_k_{s}",f"Lcorr_k_{s}",f"choice_{s}") )
+        
+        nuts_kernel = NUTS(self.model, init_strategy = init_to_median(num_samples=100) , dense_mass = dense_blocks)        #, dense_mass =   [("innov_scale",), ("Lcorr_k_0",), ("beta",), ("P_rest",)] )
+        kernel      = nuts_kernel #DiscreteHMCGibbs(nuts_kernel)
+        mcmc        = MCMC(kernel
+                    , num_warmup     = 3000
+                    , num_samples    = 3500
+                    , num_chains     = 1
+                    , jit_model_args = False)
+
+
+
+        if X is not None:
+           y_past = np.hstack([ X, Y[0] ])
+           target_indicators = [target_indicators[0]+X.shape[-1]]
+           self.target_indicators_mcmc = target_indicators
+        else:
+            y_past = Y[0]
+        self.y_past = y_past
+
+        print(self.tobs)
+        
+        mcmc.run(jax.random.PRNGKey(20200320)
+                              ,y_past            = y_past
+                              ,y_target          = y
+                              ,B                 = B_norm
+                              ,Sb                = Sb
+                              ,target_centers    = self.y_means
+                              ,target_scales     = self.y_scales
+                              ,Ls                = self.estimated_factors_y
+                              ,column_shifts            = self.column_shifts
+                              ,IL                = IL
+                              ,IK                = IK
+                              ,Kp                = Kp
+                              ,Kp_l              = self.Kp_l
+                              ,Kp_U              = self.Kp_U
+                              ,copies            = self.copies
+                              ,tobs              = self.tobs[0]
+                              ,target_indicators = target_indicators
+                              , scales = self.global_std
+                              ,centers = self.global_mu
+                              , Kmix             = self.Kmix 
+                              ,forecast          = None )
+                              #,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy"))
+
+        self.mcmc = mcmc
+        mcmc.print_summary()
+        samples = mcmc.get_samples()
+        self.posterior_samples = samples
+
+        #--diagnostics
+        # extra = mcmc.get_extra_fields()
+
+        # print("divergences:", int(extra["diverging"].sum()))
+
+        # steps = np.asarray(extra["num_steps"])
+        # print("num_steps median / 90% / max:", np.median(steps), np.quantile(steps, 0.9), steps.max())
+
+        # acc = np.asarray(extra["accept_prob"])
+        # print("accept_prob mean:", acc.mean(), "min:", acc.min(), "max:", acc.max())
+
+        # # Step size (after adaptation)
+        # print("step_size:", float(mcmc.last_state.adapt_state.step_size))
+
+        # if "energy" in extra:
+        #     E = np.asarray(extra["energy"])
+        #     ebfmi = np.mean(np.diff(E)**2) / np.var(E)
+        #     print("E-BFMI:", ebfmi)  # rule of thumb: < 0.3 is concerning
+
+        # div_idx = np.where(np.asarray(extra["diverging"]))[0]
+        # print("divergent draws:", div_idx[:20], "count:", len(div_idx))
+
+        # for name in ["A_logit_0", "Q_diags", "global_sigma_rw", "global_f_sigma"]:
+        #     if name in samples:
+        #         vals = np.asarray(samples[name])
+        #         print(name, "divergent mean:", vals[div_idx].mean(), "overall mean:", vals.mean())
+
+        return self
+
+    def forecast(self):
+        from numpyro.infer import Predictive
+        predictive = Predictive(self.model,posterior_samples = self.posterior_samples
+                                , return_sites               = list(self.posterior_samples.keys()) + ["y_pred","pred_paths"] )
+
+        rng_key    = jax.random.PRNGKey(100915)
+        pred_samples = predictive( rng_key
+                              ,y_past            = self.y_past
+                              ,y_target          = self.y
+                              ,B                 = self.B_norm
+                              ,Sb                = self.Sb
+                              ,target_centers    = self.y_means
+                              ,target_scales     = self.y_scales
+                              ,Ls                = self.estimated_factors_y
+                              ,column_shifts     = self.column_shifts
+                              ,IL                = self.IL
+                              ,IK                = self.IK
+                              ,Kp                = self.Kp
+                              ,Kp_l              = self.Kp_l
+                              ,Kp_U              = self.Kp_U
+                              ,copies            = self.copies
+                              ,tobs              = self.tobs[0]
+                              ,target_indicators = self.target_indicators_mcmc
+                              , scales = self.global_std
+                              , centers = self.global_mu
+                              , Kmix             = self.Kmix 
+                              ,forecast          = True
+                                  )
+        yhat_draws = pred_samples["y_pred"]      # (draws, T, S)
+
+        self.pred_samples = pred_samples
+        self.forecast     = yhat_draws
+        return yhat_draws
+    
 
 
 
@@ -650,236 +976,6 @@ class puca( object ):
         # )
         # numpyro.factor("ll_y", jnp.sum(logys))
 
-        
-    def estimate_factors(self,D):
-        u, s, vt            = np.linalg.svd(D, full_matrices=False)
-        splain              = np.cumsum(s**2) / np.sum(s**2)
-        estimated_factors_D = (np.min(np.argwhere(splain > .95)) + 1)
-        return estimated_factors_D, (u,s,vt)
-
-    def fit(self
-            , estimated_lmax_x = True
-            , estimated_lmax_y = None
-            , Kmix             = 1
-            , run_SVI          = True
-            , use_anchor       = False):
-
-        y, Y, X     = self.y, self.Y, self.X
-        all_y       = self.all_y
-        self.Kmix = Kmix
-
-        #--SVD for X
-        if estimated_lmax_y is None:
-            Ls, us, vts, lambdas = [],[],[], []
-            for _ in Y:
-                nfactors, (u,s,vt) = self.estimate_factors(_)
-                Ls.append(nfactors)
-                us.append(u)
-                lambdas.append(s)
-                vts.append(vt)
-                
-            self.estimated_factors_y = Ls
-            self.us                  = us
-            self.lambdas             = lambdas 
-            self.vts                 = vts
-        else:
-            self.estimated_factors_y = estimated_lmax_y
-
-        from patsy import dmatrix
-
-        def bs_basis_zero_padded(tvals):
-            def bs_basis(tvals):
-                return np.asarray(
-                    dmatrix(
-                        "bs(t, knots=knots, degree=3, include_intercept=True, "
-                        "lower_bound=lb, upper_bound=ub) - 1",
-                        {"t": tvals, "knots": knots, "lb": lb, "ub": ub},
-                    )
-                )
-            
-            tvals = np.asarray(tvals, float)
-            ok = (tvals >= lb) & (tvals <= ub)
-
-            # build basis for clipped values (any in-range values ok)
-            B = np.zeros((len(tvals), bs_basis(np.array([lb])).shape[1]), float)
-            if ok.any():
-                B_ok = bs_basis(tvals[ok])  # uses fixed knots/bounds
-                B[ok] = B_ok
-            return B
-
-        def bs_basis_numpy(tvals, knots, lb, ub):
-            return np.asarray(
-                dmatrix(
-                    "bs(t, knots=knots, degree=3, include_intercept=True, "
-                    "lower_bound=lb, upper_bound=ub) - 1",
-                    {"t": np.asarray(tvals, float), "knots": knots, "lb": lb, "ub": ub},
-                )
-            )
-
-
-        # time grid
-        T = self.T
-
-        # choose fixed spline settings
-        lb, ub = -20, (T-1) + 20
-        t      = np.arange(lb,ub+1)
-        knots  = np.arange(lb, ub, 2)[1:]
-        
-        B            = bs_basis_numpy(t,knots,lb,ub)
-        self.B       = B
-
-        D            = jnp.std(B, 0) 
-        Sb           = jnp.diag( D )
-        B_norm       = B@jnp.diag(1./D)
-
-        self.B_norm = B_norm
-        self.Sb     = Sb
-
-        D          = jnp.diff(jnp.diff(jnp.eye(B.shape[-1]),axis=0),axis=0)
-        Kp         = D.T@D
-        self.Kp    = Kp
-        
-        model      = self.model
-        copies     = self.copies
-        
-        #--collect helpful parameters
-        S_past_total      = int(sum(copies))
-        num_targets       = len(copies)
-        S                 = S_past_total + num_targets
-
-        #--we will flateen target_indicators
-        copies_j                    = jnp.array(self.target_indicators)        
-        starts                      = jnp.concatenate([jnp.array([0]), jnp.cumsum(copies_j + 1)[:-1]])
-        target_indicators           = starts + copies_j
-        self.target_indicators_mcmc = target_indicators
-
-        IL                = jnp.eye( int(sum(self.estimated_factors_y)))
-        self.IL           = IL
-
-        IK                 = jnp.eye(B_norm.shape[1])
-        self.IK           = IK
-        
-        rng_post          = jax.random.PRNGKey(100915)
-        num_draws         = 5*10**3
-
-        print("4")
-
-        dense_blocks = [
-            ("beta", "tau_diff","b"),                          # spline shape + smoothness + level
-            ("P_blk_raw", "P_rest", "tau_P", "lambda_P"),       # P hierarchy
-            ("Qraw", "Q_scales"),                               # target loading
-            ("global_scale", "local_scale"),     # RW scales (optionally add "start_z")
-            # optionally:
-            # ("innov_scale", "start_z")                        # only if S*(T-1) is not too big
-        ]
-        # for s in range(num_targets):
-        #     dense_blocks.append( (f"pi_{s}",f"mu_k_{s}",f"sigma_k_{s}",f"Lcorr_k_{s}",f"choice_{s}") )
-        
-        nuts_kernel = NUTS(self.model, init_strategy = init_to_median(num_samples=100) , dense_mass = dense_blocks)        #, dense_mass =   [("innov_scale",), ("Lcorr_k_0",), ("beta",), ("P_rest",)] )
-        kernel      = DiscreteHMCGibbs(nuts_kernel)
-        mcmc        = MCMC(kernel
-                    , num_warmup     = 3000
-                    , num_samples    = 3500
-                    , num_chains     = 1
-                    , jit_model_args = False)
-
-
-
-        if X is not None:
-           y_past = np.hstack([ X, Y[0] ])
-           target_indicators = [target_indicators[0]+X.shape[-1]]
-           self.target_indicators_mcmc = target_indicators
-        else:
-            y_past = Y[0]
-        self.y_past = y_past
-
-        print(self.tobs)
-        
-        mcmc.run(jax.random.PRNGKey(20200320)
-                              ,y_past            = y_past
-                              ,y_target          = y
-                              ,B                 = B_norm
-                              ,Sb                = Sb
-                              ,target_centers    = self.y_means
-                              ,target_scales     = self.y_scales
-                              ,Ls                = self.estimated_factors_y
-                              ,IL                = IL
-                              ,IK                = IK
-                              ,Kp                = Kp
-                              ,copies            = self.copies
-                              ,tobs              = self.tobs[0]
-                              ,target_indicators = target_indicators
-                              , scales = self.global_std
-                              ,centers = self.global_mu
-                              , Kmix             = self.Kmix 
-                              ,forecast          = None )
-                              #,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy"))
-
-        self.mcmc = mcmc
-        mcmc.print_summary()
-        samples = mcmc.get_samples()
-        self.posterior_samples = samples
-
-        #--diagnostics
-        # extra = mcmc.get_extra_fields()
-
-        # print("divergences:", int(extra["diverging"].sum()))
-
-        # steps = np.asarray(extra["num_steps"])
-        # print("num_steps median / 90% / max:", np.median(steps), np.quantile(steps, 0.9), steps.max())
-
-        # acc = np.asarray(extra["accept_prob"])
-        # print("accept_prob mean:", acc.mean(), "min:", acc.min(), "max:", acc.max())
-
-        # # Step size (after adaptation)
-        # print("step_size:", float(mcmc.last_state.adapt_state.step_size))
-
-        # if "energy" in extra:
-        #     E = np.asarray(extra["energy"])
-        #     ebfmi = np.mean(np.diff(E)**2) / np.var(E)
-        #     print("E-BFMI:", ebfmi)  # rule of thumb: < 0.3 is concerning
-
-        # div_idx = np.where(np.asarray(extra["diverging"]))[0]
-        # print("divergent draws:", div_idx[:20], "count:", len(div_idx))
-
-        # for name in ["A_logit_0", "Q_diags", "global_sigma_rw", "global_f_sigma"]:
-        #     if name in samples:
-        #         vals = np.asarray(samples[name])
-        #         print(name, "divergent mean:", vals[div_idx].mean(), "overall mean:", vals.mean())
-
-        return self
-
-    def forecast(self):
-        from numpyro.infer import Predictive
-        predictive = Predictive(self.model,posterior_samples = self.posterior_samples
-                                , return_sites               = list(self.posterior_samples.keys()) + ["y_pred"])
-
-        rng_key    = jax.random.PRNGKey(100915)
-        pred_samples = predictive( rng_key
-                              ,y_past            = self.y_past
-                              ,y_target          = self.y
-                              ,B                 = self.B_norm
-                              ,Sb                = self.Sb
-                              ,target_centers    = self.y_means
-                              ,target_scales     = self.y_scales
-                              ,Ls                = self.estimated_factors_y
-                              ,IL                = self.IL
-                              ,IK                = self.IK
-                              ,Kp                = self.Kp
-                              ,copies            = self.copies
-                              ,tobs              = self.tobs[0]
-                              ,target_indicators = self.target_indicators_mcmc
-                              , scales = self.global_std
-                              , centers = self.global_mu
-                              , Kmix             = self.Kmix 
-                              ,forecast          = True
-                                  )
-        yhat_draws = pred_samples["y_pred"]      # (draws, T, S)
-
-        self.pred_samples = pred_samples
-        self.forecast     = yhat_draws
-        return yhat_draws
-    
 
 if __name__ == "__main__":
 
