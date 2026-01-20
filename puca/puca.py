@@ -155,48 +155,46 @@ class puca( object ):
         M               = 10
         
         #--This is a smoothness penalty 
-        #alpha     = numpyro.sample("alpha", dist.Gamma(2, 2./100 ).expand([K,L]))
-        alpha     = numpyro.sample("alpha", dist.Gamma(1, 0.005).expand([L]))
-        
-        tau_diff  = 1./jnp.sqrt(alpha)
-        
+        #tau_diff = jnp.ones((L,))*0.1
+
+        sd_tau_diff = numpyro.sample("sd_tau_diff", dist.HalfNormal(1))
+        z__tau_diff = numpyro.sample("z__tau_diff", dist.Normal(0,1).expand([L]))
+        tau_diff    = jnp.exp(jnp.log( 0.1 ) + sd_tau_diff*z__tau_diff )
+
         null        = 2
         U0          = Kp_U[:, :null]        
         Up          = Kp_U[:, null:]
         lp          = Kp_l[null:]
 
-        #a  = 20
-        #s0 = 0.10
-        #beta0_raw   = numpyro.sample("beta0_raw", dist.Normal(0, 1).expand([U0.shape[1], L]))
-        #beta0_prec  = numpyro.sample("beta0_prec", dist.Gamma(a, a*s0**2))  # mean = 1/s0^2
-        #beta0       = beta0_raw / jnp.sqrt(beta0_prec)
+        beta0       =  jnp.zeros( (U0.shape[1], L) ) #
         
         z_beta      = numpyro.sample("beta", dist.Normal(0,1).expand([lp.shape[0] ,L]) )
         
         def produce_beta( tau_diff, z_beta, Up, lp ):
-            on_diag    =   (lp/tau_diff**2) + 10**-6
+            on_diag    =   (lp/tau_diff**2) #+ 10**-6
             beta       =  ( Up * (1/jnp.sqrt(on_diag)  ))   @ z_beta
             return beta
         beta = jax.vmap( lambda x,y:produce_beta(x,y,Up,lp), in_axes = (0,1) )( tau_diff, z_beta  )
         beta = beta.T
 
-        #beta = U0@beta0 + beta
+        beta = U0@beta0 + beta
 
         X_shifts, y_shift = column_shifts[:S_past_total], column_shifts[-1]
-
+        
         base        = jnp.arange(T)
         
         B_shifted   = B[ (M+base)[:,None] - X_shifts[None,:]  ]
+        B_shifted   = B_shifted - B_shifted[0,...][None,...] # <- enforce a zero start
+        
         Fx          = B_shifted @ beta              #<--T X S X L
         
-        sFx = jnp.std(Fx, axis=(0,1))
-        mFx         = jnp.mean(Fx, axis=0)
-
-        Fx          = Fx 
-
+        mFx         = jnp.mean( Fx, axis=0 ).reshape(1, S-1, L)
+        sFx         = jnp.std(  Fx, axis=0 ).reshape(1, S-1, L)
+        Fx          = (Fx - mFx ) / sFx
+        
         numpyro.deterministic("Fx",Fx)
        
-        #--P matrix so that X = Fnorm @ P
+        # #--P matrix so that X = Fnorm @ P
         P_global_prec = numpyro.sample("P_global_prec" , dist.Gamma(2,2./4))
         P_global_prec = 1./ jnp.sqrt(P_global_prec)
         
@@ -204,161 +202,254 @@ class puca( object ):
         P_local_prec   = Trans.OrderedTransform()(P_local_prec)
         
         gScale        = (P_global_prec * P_local_prec)
+
+        # n_tril = L * (L - 1) // 2
+
+        # if n_tril > 0:
+        #     r,c          = jnp.tril_indices(L,k=-1)
+        #     P_zeros      = jnp.zeros((L,L))
+        #     z_P_blk_raw  = numpyro.sample("z_P_blk_raw", dist.Normal(0,1).expand([ int(L*(L-1)/2) ] ))
+        #     P_blk        = gScale*( P_zeros.at[r,c].set(z_P_blk_raw) ) + IL
+        # else:
+        #     P_blk = IL
+
+        # P_rest       = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S - L]))
+        # P_rest       = gScale*P_rest
         
-        r,c          = jnp.tril_indices(L,k=-1)
-        P_zeros      = jnp.zeros((L,L))
-        z_P_blk_raw  = numpyro.sample("z_P_blk_raw", dist.Normal(0,1).expand([ int(L*(L-1)/2) ] ))
-        P_blk        = gScale*( P_zeros.at[r,c].set(z_P_blk_raw) ) + IL  
-
-        P_rest       = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S - 1 - L]))
-        P_rest       = gScale*P_rest
-        P            = jnp.concatenate([P_rest, P_blk], axis=1) #<--LXS
-        P            = P.at[0,:].set( jax.nn.softplus(P[0,:]) )
+        # A            = jnp.concatenate([P_rest, P_blk], axis=1) #<--LXS
         
-        numpyro.deterministic("P",P)
-        #P            = P #* sFx[:,None]
+        # Q_scale = numpyro.sample("Q_scale", dist.Normal(0,1) )
+        # Q_scale = jnp.exp( Q_scale * jnp.log(2)/2 )
 
-        Q_global_prec = numpyro.sample("Q_global_prec" , dist.Gamma(2,2.).expand([L,1]))
-        Q_scales      = 1./ jnp.sqrt(Q_global_prec)
+        S_tot = S  # include target season too
+                
+        # row scales (you already have gScale; shape (L,1) or (L,))
+        row_scale = gScale.squeeze(-1)  # (L,)
 
-        Qraw          = numpyro.sample("Qraw"    , dist.Normal(0,1).expand([L,1])  )
-        Q             = Q_scales*Qraw
+        # exchangeable correlation across seasons
+        rho = numpyro.sample("rho_season", dist.Beta(5., 2.))  # encourages rho > 0
+        R = (1. - rho) * jnp.eye(S_tot) + rho * jnp.ones((S_tot, S_tot))
+        chol_R = jnp.linalg.cholesky(R + 1e-6 * jnp.eye(S_tot))  # jitter
+
+        # optional per-season amplitude
+        col_scale = numpyro.sample("col_scale", dist.HalfNormal(1.).expand([S_tot]))  # (S,)
+        Lcol = jnp.diag(col_scale) @ chol_R  # this is D * L_R
+
+        # iid standard normal
+        Z = numpyro.sample("Z_A", dist.Normal(0,1).expand([L, S_tot]))
+
+        # A = S_row * Z * (D L_R)^T
+        A = row_scale[:, None] * (Z @ Lcol.T)  # (L,S)
+
+        P = A[:,1:]
+        Q = A[:,0]
+
+        numpyro.deterministic("A", A)
+        numpyro.deterministic("P", P)
         numpyro.deterministic("Q", Q)
 
-        #--compute trends
-        Xtrend = jnp.einsum("tsl,ls->ts",Fx,P) #<-TXS
-        numpyro.deterministic("Xtrend",Xtrend)
-        
-        #ytrend = (Fy@Q).reshape(T,1)
-        #numpyro.deterministic("ytrend",ytrend)
-        
         #--AR
-        eps  = 0.025
-        flex = 2
-        global_prec  = numpyro.sample("global_prec", dist.Gamma( 5, 5.*(flex*eps)**2))#  /500  ) )
-        global_scale = 1./jnp.sqrt(global_prec)
-        numpyro.deterministic("global_scale", global_scale)
-
-        local_prec = numpyro.sample("local_prec", dist.Gamma(2,2).expand([S]) )
-        local_scale = 1./jnp.sqrt(local_prec)
-        numpyro.deterministic("local_scale", local_scale)
-
-        path_scale = global_scale * local_scale
-
-        # innov_z           = numpyro.sample("innov_z"    , dist.Normal(0,1).expand([1,T-1])) #<--one for P and one for Q
-
-        start              = jnp.zeros((1,1)) 
-        #innovations        = path_scale[-1,None]*innov_z
-        phi=1.
-
-        intercept_perc            = numpyro.sample("intercept_perc"           , dist.Gamma(2,2)) 
-        season_specific_intercept = numpyro.sample("season_specific_intercept", dist.Normal(0, 1.).expand([S]))   # (L,)
-        season_specific_intercept = season_specific_intercept / jnp.sqrt(intercept_perc)
-
-        # def step(x_next, z_t, phi):
-        #     x_t = phi * (x_next) + z_t
-        #     return x_t, x_t
-        # _, xs_rev = jax.lax.scan( lambda x,y: step(x,y,phi), init=start, xs=innovations.T )  # xs_rev is [x_{T-2}, x_{T-3}, ..., x_0]
-
-        # y_path = jnp.concatenate([jnp.flip(xs_rev.squeeze(), axis=0), start.squeeze()[None,]], axis=0)  # [x_0,...,x_{T-1}]  T X S
-
-        X_target = jnp.hstack(y_past).reshape(T,S_past_total)
-        Xtrend   = Xtrend + season_specific_intercept[None, :-1]
-
-        resid = X_target - Xtrend
-        Xmask = jnp.isfinite(resid)
-        resid_filled = jnp.where(Xmask, resid, 0.0)
+        eps         = 1.
         
+        q            = numpyro.sample("qh", dist.Uniform(0.001,2).expand([S]))
+        path_scale   = 0.5+q
+       
+        start_sigma = jnp.ones((S,))*0.0001
+        start_mean  = jnp.zeros( (S,) )  
+
+        Xtarget = jnp.hstack(y_past).reshape(T,S_past_total)
+
+        Xtrend  = jnp.einsum("tsl,ls->ts",Fx,P) #<-TXS
+        Xtrend  = Xtrend #+ season_specific_intercept[None, :-1]
+        numpyro.deterministic("Xtrend",Xtrend)
+
+        resid          = Xtarget - Xtrend
+
+        Xmask        = jnp.isfinite(resid)
+        resid_filled = jnp.where(Xmask, resid, 0.0)
+
+        rho          = 1
+
+        sd_r_pins = numpyro.sample("sd_r_pins" , dist.HalfNormal(1/2))
+        mn_r_pins = numpyro.sample("mn_r_pins" , dist.Normal(0,1))
+        z__r_pins = numpyro.sample("z__r_pins" , dist.Normal(0,1).expand([S]))
+        
+        r_pins    = 0.01 + jnp.exp( (mn_r_pins) + z__r_pins*sd_r_pins)
+
         #--kalm likelihood here
-        def kf(carry, array, q, r):
-            m,P     = carry
-            yobs,mk = array
+        def kf(carry, array, q, r, rho, r_pin):
+            mt,Pt    = carry
+            yobs,mk  = array
 
-            xtp1_E = m
-            xtp1_P = P+q
+            m_pred = rho*mt
+            p_pred = (rho**2)*Pt+q
 
-            ytp1_E = m
-            ytp1_P = P+q+r
+            y_p_pred = (rho**2)*Pt+q+r
+            
+            S = p_pred + r
+            K = p_pred / S
 
-            K = 1./( 1 + (r/(P+q)) )
-
-            innov      = (yobs-m)
-            xtp1_yp1_E = m + K*innov
-            xtp1_yp1_P = (P+q)*(1-K)
+            innov      = (yobs-m_pred)*mk
+            
+            m_filt = m_pred + K*innov
+            P_filt = p_pred * (1-K*mk)
 
             LOG2PI = jnp.log(2.0 * jnp.pi)
-            ll     = -0.5 * (LOG2PI + jnp.log(ytp1_P) + (innov * innov) / ytp1_P)
-            ll     = mk * ll
+            ll     = mk*(-0.5 * (LOG2PI + jnp.log(S) + (innov**2) / S))
 
-            return (xtp1_yp1_E,xtp1_yp1_P), ll
+            #pseudo-observation: z = 0 ~ N(m, P + r_pin)
+
+            S_pin = P_filt + r_pin
+            Kp    = P_filt / (S_pin)
             
-        _,LL_xs = jax.vmap( lambda path_scale_indiv, data, mask : jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=path_scale_indiv**2) , init = ( jnp.array(0.), 10**-6  ), xs = ( data, mask.squeeze() ), reverse=True   )
-                            , in_axes=(0,1,1) )(path_scale[:-1], resid_filled, Xmask)
+            ll_pin = -0.5 * (jnp.log(2*jnp.pi) + jnp.log(S_pin) + (0-m_filt)**2 / (S_pin))
+
+            mpost = m_filt + Kp*(0-m_filt)
+            ppost = P_filt - Kp*P_filt
+            
+            ll_ttl = ll + ll_pin
+            
+            return (mpost,ppost), (ll_ttl, m_pred, p_pred, mpost, ppost  )
+            #return (xp_y_E,xp_y_P), (ll, xp_E, xp_P, xp_y_E, xp_y_P  )
+        
+        _,(LL_xs,_,_,_,_) = jax.vmap( lambda path_scale_indiv, data, mask, start_m,start_s, r_pin : jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=path_scale_indiv**2,rho=rho, r_pin=r_pin**2) , init = ( start_m,start_s  ), xs = ( data, mask.squeeze() ), reverse=True   )
+                            , in_axes=(0,1,1,0,0,0) )(path_scale[:-1], resid_filled, Xmask, start_mean[:-1], start_sigma[:-1], r_pins[:-1])
         numpyro.factor( "LL_x", jnp.sum(LL_xs) )
 
-        eps_y  = (eps) * scales
+        # with numpyro.handlers.mask(mask=Xmask):
+        #     numpyro.sample("LLX", dist.Normal( Xtrend, eps ), obs = Xtarget )
+
+        eps_scale = 1
+        eps_y     = (eps*eps_scale) * scales
 
         y_target = jnp.hstack(y_target).reshape(T,1)
         
         ymask     = jnp.isfinite(y_target)
 
+        y_pin = r_pins[-1]
+        
         #--shifting probabilities
-        index_weights = index_weights+10**-2
-        index_probs   = numpyro.sample( "index_weights", dist.Dirichlet( index_weights) )
+        #index_weights = index_weights+10**-2
+        #index_probs   = numpyro.sample( "index_weights", dist.Dirichlet( index_weights) )
+        #index_probs = jnp.clip(index_probs, 1e-12, 1.0)
 
-        def from_shift_to_prob(shift, y_path_scale):
+        #print(self.column_shifts)
+        #print(y_shift)
+        #index_probs = jnp.zeros( (len(index_weights)) )
+        #index_probs = index_probs.at[y_shift].set(1.)
+        
+        def from_shift_to_prob(shift, y_path_scale, y_pin):
             B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
-            y_trend  = (B_y@beta@Q).reshape(T,1) + season_specific_intercept[-1]  #+  y_path)
+            B_y      = B_y - B_y[0,:]
 
+            F_y      = (B_y@beta@Q).reshape(T,1)
+            y_trend      = F_y 
+            
             resid        =  ((y_target - centers)/scales) - y_trend
             ymask        =  jnp.isfinite(resid)
-            resid_filled = jnp.where(ymask, resid, 0.0)
+            resid_filled =  jnp.where(ymask, resid, 0.0)
 
-            _,LL_y = jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=y_path_scale**2) , init = ( jnp.array(0.), 10**-6  ), xs = ( resid_filled.squeeze(), ymask.squeeze() ), reverse=True)
-            return jnp.sum( LL_y )
+            (m_last, P_last),(LL_y,xstep_E,xstep_P,xE,xP) = jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=y_path_scale**2,rho=rho,r_pin=y_pin**2) , init = ( start_mean[-1], start_sigma[-1] ), xs = ( resid_filled.squeeze(), ymask.squeeze() ), reverse=True)
 
+            return jnp.sum( LL_y ), xstep_E,xstep_P,xE,xP,m_last, P_last
+
+        start        = jnp.zeros((1,))  
+        shift        = y_shift
         y_path_scale = path_scale[-1]
-        shifts       = jnp.arange(-M,M+1) 
-        probs        = jax.vmap( lambda x: from_shift_to_prob(x, y_path_scale))( shifts )
-        logw         = probs + jnp.log(index_probs)            # (2M+1,)
 
-        prior = jnp.log( index_probs )
-        LLY   = jax.scipy.special.logsumexp( (probs + prior)  )
-        numpyro.factor( "LLY", LLY )
         
+        B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
+        B_y      = B_y - B_y[0,:]
+
+        F_y      = (B_y@beta@Q).reshape(T,1)
+        y_trend  =  F_y 
+        numpyro.deterministic("y_trend", y_trend)
+
+        shift                                   = y_shift  # deterministic shift value
+        LLY, mp1, Pp1, m_t, P_t, m_last, P_last = from_shift_to_prob(shift, y_path_scale, y_pin)
+        numpyro.factor( "LLY", LLY )
+
+        # shift = y_shift
+        
+        # B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
+        # B_y      = B_y - B_y[0,:]
+        
+        # Fy      = (B_y@beta).reshape(T,L)
+
+        # mFy         = jnp.mean( Fy, axis=0 ).reshape(1,L)
+        # sFy         = jnp.std( Fy, axis=0 ).reshape(1,L)
+        # Fy          = (Fy - mFy ) / sFy
+
+        # Fy = (Fy @ Q).reshape(T,1)
+        # y_trend      = numpyro.deterministic("y_trend", Fy )
+
+        # with numpyro.handlers.mask(mask=ymask):
+        #     numpyro.sample("LLY", dist.Normal( y_trend, eps_y ), obs = y_target )
+        
+       
         if forecast:
-            #--trned component
-            shift_post = jax.nn.softmax(logw)              # normalized responsibilities
-            shift_idx   = numpyro.sample("shift", dist.Categorical(shift_post) )
-            shift       = shifts[shift_idx]
+            innov_z      = numpyro.sample("new_innov_z"    , dist.Normal(0,1).expand([ T ])) #<--one for P and one for Q
+            eps          = y_path_scale*innov_z
+
+            xT           = numpyro.sample("xT", dist.Normal(m_t[-1], jnp.sqrt(P_t[-1]) ))
             
-            B_y      = B[M + base - shift,:] 
-            F_y      = B_y@beta 
-
-            #--noise path component
-            innov_z      = numpyro.sample("new_innov_z"    , dist.Normal(0,1).expand([1,T-1])) #<--one for P and one for Q
-
-            start        = start[-1].reshape(-1,1)
-            innovations  = y_path_scale*innov_z
-           
-            def step(x_next, z_t, phi):
-                x_t = phi * (x_next) + z_t
+            def step_ffbs(x_next, inputs):
+                eps_t, m_t, P_t, mp1, Pp1 = inputs  # all scalars
+                J    = rho * P_t / (Pp1 )
+                mean = m_t + J * (x_next - mp1)
+                var  = P_t - (J * J) * Pp1
+                #var  = jnp.maximum(var, tiny)
+                x_t  = mean + jnp.sqrt(var) * eps_t
                 return x_t, x_t
-            _, xs_rev = jax.lax.scan( lambda x,y: step(x,y,phi), init=start, xs=innovations.T)  # xs_rev is [x_{T-2}, x_{T-3}, ..., x_0]
 
-            y_path = jnp.concatenate([jnp.flip(xs_rev.squeeze(), axis=0), start.squeeze()[None,]], axis=0)  # [x_0,...,x_{T-1}]  T X S
+            inputs_rev = (eps[:-1][::-1], m_t[:-1][::-1], P_t[:-1][::-1], mp1[:-1][::-1], Pp1[:-1][::-1])
+            _, xs_rev  = jax.lax.scan(step_ffbs, init=xT, xs=inputs_rev)
+            x_path     = jnp.concatenate([xs_rev[::-1], xT[None]], axis=0)
+            
+            numpyro.sample( "y_pred", dist.Normal( (y_trend+x_path.reshape(T,1) )*scales + centers, eps_y))
+                           
+            #--trned component
+            #shift_post = jax.nn.softmax(logw)              # normalized responsibilities
+            #shift_idx   = numpyro.sample("shift", dist.Categorical(shift_post) )
+            #shift       = shifts[shift_idx]
+            # shift = y_shift
 
-            y  = (F_y@Q).reshape(T,1)  + season_specific_intercept[-1] +  y_path[:,None]
-            yhat_    = y *scales + centers
+            #blarp
+            
+            # B_y      = B[M + base - shift,:]
+            # B_y      = B_y - B_y[0,:] 
+            
+            # F_y      = numpyro.deterministic("F_y", (B_y@beta@Q).reshape(T,1))
 
-            #numpyro.deterministic("y_trend_pred", y_trend*scales + centers)
-            numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
+            # #--noise path component
+            
+
+            # start        = numpyro.sample("pred_start", dist.Normal( start_mean[-1], start_sigma[-1])).reshape(1,1)
+            # 
+            # numpyro.deterministic("innovations",innovations)
+
+            # y_path = numpyro.sample( "y_path", dist.Normal(ye,yp)  ) 
+            
+            # y  = F_y + season_specific_intercept[-1] +  y_path[:,None]
+            # yhat_    = y *scales + centers
+
+            # #numpyro.deterministic("y_trend_pred", y_trend*scales + centers)
+            # numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
+
+            # numpyro.deterministic("path_scale", path_scale)
+            # numpyro.deterministic("y_path_scale", y_path_scale)
 
 
     def estimate_factors(self,D):
         u, s, vt            = np.linalg.svd(D, full_matrices=False)
         splain              = np.cumsum(s**2) / np.sum(s**2)
-        estimated_factors_D = (np.min(np.argwhere(splain > .95)) + 1)
+        estimated_factors_D = np.min(np.argwhere(splain > .95))
+
+        if estimated_factors_D==0:
+            estimated_factors_D=1
+
+        print(estimated_factors_D)
+        
         return estimated_factors_D, (u,s,vt)
 
 
@@ -429,7 +520,7 @@ class puca( object ):
         #--Choose fixed spline settings and pad them from -M to M for a total of 2M+1 potential reference points (dont forget zero)
         lb, ub = -M, (T-1) + M
         t      = np.arange(lb,ub+1)
-        knots  = np.arange(lb, ub, 2)[1:]
+        knots  = np.arange(lb, ub, 1)[1:] #was originally 2
 
         B            = bs_basis_numpy(t,knots,lb,ub)
 
@@ -445,6 +536,7 @@ class puca( object ):
 
         #--While we're here we should compute the matrix of second differences (D) and the penalty matrix Kp
         D          = jnp.diff(jnp.diff(jnp.eye(B.shape[-1]),axis=0),axis=0)
+        #D         = jnp.diff(D,axis=0)
         
         Kp         = D.T@D
         
@@ -522,111 +614,115 @@ class puca( object ):
 
         print(self.tobs)
 
-        # guide = AutoBNAFNormal(
+        #--SVI start
+        # guide = AutoIAFNormal(
         #     self.model
-        #     ,num_flows=2
+        #     ,num_flows=4
         #     ,init_loc_fn=init_to_median(num_samples=100)
         # )
-
-        guide = AutoIAFNormal(
-            self.model
-            ,num_flows=2
-            ,init_loc_fn=init_to_median(num_samples=100)
-        )
  
-        optimizer = ClippedAdam(step_size= 10**-4, clip_norm=1)  # common starting point: 1e-3 to 1e-2
-        loss      = Trace_ELBO(num_particles=3)
+        # optimizer = ClippedAdam(step_size= 4*10**-5, clip_norm=1)  # common starting point: 1e-3 to 1e-2
+        # loss      = Trace_ELBO(num_particles=3)
 
-        svi = SVI(self.model, guide, optimizer, loss)
+        # svi = SVI(self.model, guide, optimizer, loss)
 
-        svi_result = svi.run(
-            jax.random.PRNGKey(20200320),
-            10*10**3,
-            y_past            = y_past,
-            y_target          = y,
-            B                 = self.B,
-            Sb                = self.Sb,
-            Ls                = self.estimated_num_components_y,
-            column_shifts     = self.column_shifts,
-            index_weights     = self.index_weights,
-            IL                = self.IL,
-            IK                = self.IK,
-            Kp_l              = self.Kp_l,
-            Kp_U              = self.Kp_U,
-            copies            = self.copies,
-            tobs              = self.tobs[0],
-            target_indicators = target_indicators,
-            scales            = self.global_std,
-            centers           = self.global_mu,
-            forecast          = None,
-        )
+        # svi_result = svi.run(
+        #     jax.random.PRNGKey(20200320),
+        #     10*10**3,
+        #     y_past            = y_past,
+        #     y_target          = y,
+        #     B                 = self.B,
+        #     Sb                = self.Sb,
+        #     Ls                = self.estimated_num_components_y,
+        #     column_shifts     = self.column_shifts,
+        #     index_weights     = self.index_weights,
+        #     IL                = self.IL,
+        #     IK                = self.IK,
+        #     Kp_l              = self.Kp_l,
+        #     Kp_U              = self.Kp_U,
+        #     copies            = self.copies,
+        #     tobs              = self.tobs[0],
+        #     target_indicators = target_indicators,
+        #     scales            = self.global_std,
+        #     centers           = self.global_mu,
+        #     forecast          = None,
+        #     stable_update=True
+        # )
 
-        params = svi_result.params
-        losses = svi_result.losses
-        print("final loss:", float(losses[-1]))
+        # params = svi_result.params
+        # losses = svi_result.losses
+        # print("final loss:", float(losses[-1]))
 
-        self.params = params
-        self.guide = guide
+        # self.params = params
+        # self.guide = guide
 
-        # neutra       = NeuTraReparam(guide, svi_result.params)
-        # neutra_model = neutra.reparam(self.model)
+        #--SVI Stop
+
         
-        # dense_blocks = [
-        #     ("beta","alpha"),                            # spline shape + smoothness + level
-        #     ("z_P_blk_raw", "P_global_prec", "P_local_prec"),          # P hierarchy
-        #     ("Qraw", "Q_global_prec"),
-        #     ("intercept_perc", "season_specific_intercept"),
-        #     ("global_prec", "local_prec")#,"innov_z"),  # RW scales (optionally add "start_z")
-        # ]
+        #--MCMC start
+        dense_blocks = [
+            ("z_y",),
+            ("beta","alpha"),                            # spline shape + smoothness + level
+            ("z_P_blk_raw", "P_global_prec", "P_local_prec"),          # P hierarchy
+            ("Qraw", "Q_global_prec"),
+            ("intercept_perc", "season_specific_intercept"),
+            ("global_prec", "local_prec")#,"innov_z"),  # RW scales (optionally add "start_z")
+        ]
         
-        # nuts_kernel = NUTS(self.model#neutra_model
-        #                    , init_strategy = init_to_median(num_samples=100)
-        #                    , dense_mass = dense_blocks
-        #                    ,  find_heuristic_step_size=True)     
-        # kernel      = nuts_kernel 
-        # mcmc        = MCMC(kernel
-        #             , num_warmup     = 2000
-        #             , num_samples    = 2500
-        #             , num_chains     = 1
-        #             , jit_model_args = False)
+        nuts_kernel = NUTS(self.model#neutra_model
+                           , init_strategy = init_to_median(num_samples=100)
+                           , dense_mass = [("beta",)]
+                           ,  find_heuristic_step_size=True)     
+        kernel      = nuts_kernel 
+        mcmc        = MCMC(kernel
+                    , num_warmup     = 2000
+                    , num_samples    = 2500
+                    , num_chains     = 1
+                    , jit_model_args = False)
 
-        # mcmc.run(jax.random.PRNGKey(20200320)
-        #                       ,y_past            = y_past
-        #                       ,y_target          = y
-        #                       ,B                 = self.B
-        #                       ,Sb                = self.Sb
-        #                       ,Ls                = self.estimated_num_components_y
-        #                       ,column_shifts     = self.column_shifts
-        #                       ,index_weights     = self.index_weights
-        #                       ,IL                = self.IL
-        #                       ,IK                = self.IK
-        #                       ,Kp_l              = self.Kp_l
-        #                       ,Kp_U              = self.Kp_U
-        #                       ,copies            = self.copies
-        #                       ,tobs              = self.tobs[0]
-        #                       ,target_indicators = target_indicators
-        #                       ,scales            = self.global_std
-        #                       ,centers           = self.global_mu
-        #                       ,forecast          = None 
-        #                       ,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy","adapt_state.step_size"))
+        mcmc.run(jax.random.PRNGKey(20200320)
+                              ,y_past            = y_past
+                              ,y_target          = y
+                              ,B                 = self.B
+                              ,Sb                = self.Sb
+                              ,Ls                = self.estimated_num_components_y
+                              ,column_shifts     = self.column_shifts
+                              ,index_weights     = self.index_weights
+                              ,IL                = self.IL
+                              ,IK                = self.IK
+                              ,Kp_l              = self.Kp_l
+                              ,Kp_U              = self.Kp_U
+                              ,copies            = self.copies
+                              ,tobs              = self.tobs[0]
+                              ,target_indicators = target_indicators
+                              ,scales            = self.global_std
+                              ,centers           = self.global_mu
+                              ,forecast          = None 
+                              ,extra_fields      = ("diverging", "num_steps", "accept_prob", "energy","adapt_state.step_size"))
 
-        # self.mcmc = mcmc
-        # mcmc.print_summary()
-        # samples = mcmc.get_samples()
-        # self.posterior_samples = samples
+        self.mcmc = mcmc
+        mcmc.print_summary()
+        samples = mcmc.get_samples()
+        self.posterior_samples = samples
+        #--MCMC end
+
         
         return self
 
     def forecast(self):
 
-        predictive = Predictive(self.model
-                               , guide=self.guide
-                               , params=self.params
-                               , num_samples=5000
-                               , return_sites  = ["y_pred","y_trend_pred"] )
-        
-        # predictive = Predictive(self.model,posterior_samples = self.posterior_samples
-        #                         , return_sites               = list(self.posterior_samples.keys()) + ["y_pred","y_trend_pred"] )
+        #--SVI START
+        # predictive = Predictive(self.model
+        #                        , guide=self.guide
+        #                        , params=self.params
+        #                        , num_samples=5000
+        #                        , return_sites  = ["y_pred","y_trend_pred","Fx","F_y","path_scale","y_path_scale","innovations","eps_kf","kappa","log_kappa_sigma","log_kappa_mu"] )
+        #--SVI END
+
+        #--MCMC START
+        predictive = Predictive(self.model,posterior_samples = self.posterior_samples
+                                , return_sites               = list(self.posterior_samples.keys()) + ["y_pred","y_trend_pred"] )
+        #--MCMC END
 
         rng_key    = jax.random.PRNGKey(100915)
         pred_samples = predictive( rng_key
@@ -655,383 +751,6 @@ class puca( object ):
         return yhat_draws
     
 
-
-
-        # def shift_zero_int(x, s):
-        #     """
-        #     x: (T,) or (T,L)
-        #     s: integer (can be traced)
-        #     positive s shifts RIGHT (later)
-        #     """
-        #     T = x.shape[0]
-        #     y = jnp.roll(x, s, axis=0)
-        #     idx = jnp.arange(T)
-
-        #     def pos(_):
-        #         m = (idx >= s)
-        #         m = m.reshape((T,) + (1,)*(x.ndim-1))
-        #         return y * m
-
-        #     def neg(_):
-        #         m = (idx < T + s)   # since s is negative
-        #         m = m.reshape((T,) + (1,)*(x.ndim-1))
-        #         return y * m
-
-        #     return jax.lax.cond(s >= 0, pos, neg, operand=None)
-
-        # def shift_zero_continuous(x, delta):
-        #     k = jnp.floor(delta).astype(jnp.int32)
-        #     a = delta - jnp.floor(delta)
-        #     x0 = shift_zero_int(x, k)
-        #     x1 = shift_zero_int(x, k + 1)
-        #     return (1.0 - a) * x0 + a * x1
-
-        # def sample_shifted(F_ext, delta, M):
-        #     """
-        #     F_ext: (Text, L)
-        #     delta: scalar float (can be traced)
-        #     Returns F_shift: (T, L) using linear interpolation
-        #     """
-        #     T   = F_ext.shape[0] - 2*M
-        #     pos = jnp.arange(T) + M - delta          # positions in F_ext
-        #     i0  = jnp.floor(pos).astype(jnp.int32)
-        #     a   = pos - jnp.floor(pos)
-
-        #     f0 = F_ext[i0, :]
-        #     f1 = F_ext[i0 + 1, :]
-        #     return (1.0 - a)[:, None] * f0 + a[:, None] * f1
-
-        # def sample_shifted_1d(f_ext, delta, M, T):
-        #     """
-        #     f_ext: (Text,) where Text = T + 2*M
-        #     delta: scalar shift (float). Positive shifts RIGHT (later).
-        #     returns: (T,)
-        #     """
-        #     Text = f_ext.shape[0]
-
-        #     # positions in f_ext we want to sample
-        #     pos = jnp.arange(T) + M - delta
-        #     i0  = jnp.floor(pos).astype(jnp.int32)
-        #     a   = pos - jnp.floor(pos)
-
-        #     # keep i0 in-bounds so i0+1 is valid
-        #     i0 = jnp.clip(i0, 0, Text - 2)
-
-        #     f0 = jnp.take(f_ext, i0)
-        #     f1 = jnp.take(f_ext, i0 + 1)
-        #     return (1.0 - a) * f0 + a * f1
-
-
-
-        #delta     = numpyro.sample("delta_fixed", dist.Uniform(-20+1,20-1)  )
-        #Fshifted  = sample_shifted(F_extended, delta, M)   #jax.vmap(lambda fcol, d: sample_shifted_1d(fcol, d, 20,T),in_axes=(1, 0), out_axes=1)( F_extended  , deltas)
- 
-
-        #F = shift_zero_continuous( B @ beta, delta_fixed)
-        
-        #F = B @ beta #<< This is Tpadded X L
-
-        # delta = numpyro.sample("delta", dist.Uniform(-M+1., M-1.))  # keep within support
-        # F = sample_shifted(F, delta, M)         # (T, L)
-
-        
-        #beta         = Sb @ beta #<-- (B @ Sbinv) @ (Sb @ beta). In other words, normalize the columns of our B matrix
-        
-        #--Lets assume that the F columns (it the latent time series) are correlated
-        #F          = B@beta                             #--(T,K) @ (K,L) -> T X L
-        #Fnorm      = F/sF[None,:] 
- 
-
-        #--center and scale for y
-        #Kmix = 2
-        # centers, scales = [],[]
-        # for signal, (cents, scals) in enumerate( zip(target_centers, target_scales) ):
-        #     N           = len(cents)
-        #     log_scals   = jnp.log(1+scals)
-
-        #     mu_cents    = jnp.mean(cents)
-        #     sigma_cents = jnp.std(cents) 
-        #     zc          = ((cents - mu_cents) / sigma_cents) .reshape(-1,1)
-
-        #     mu_scals    = jnp.mean(log_scals)
-        #     sigma_scals = jnp.std(log_scals)
-        #     zs = ((log_scals - mu_scals)/ sigma_scals).reshape(-1,1)
-
-        #     cs_vec = jnp.hstack([zc,zs])
-
-        #     # --- Bayesian Gaussian mixture in z-space -----------------------------
-        #     # weights
-        #     pi = numpyro.sample(f"pi_{signal}", dist.Dirichlet((1./Kmix)*jnp.ones(Kmix)))
-
-        #     # component means (in z-space)
-        #     mu_k = numpyro.sample(
-        #         f"mu_k_{signal}",
-        #         dist.Normal(0.0, 1.5).expand([Kmix, 2])
-        #     )
-
-        #     # component covariance via (scales * LKJ correlation)
-        #     # per-component marginal scales
-        #     sigma_k = numpyro.sample(
-        #         f"sigma_k_{signal}",
-        #         dist.HalfNormal(1.0).expand([Kmix, 2])
-        #     )
-        #     # per-component correlation Cholesky
-        #     Lcorr_k = numpyro.sample(
-        #         f"Lcorr_k_{signal}",
-        #         dist.LKJCholesky(dimension=2, concentration=2.0).expand([Kmix])
-        #     )  # (Kmix, 2, 2)
-
-        #     D_k = jax.vmap(jnp.diag)(sigma_k)                      # (Kmix, 2, 2)
-        #     L_k = jax.vmap(lambda D, L: D @ L)(D_k, Lcorr_k)       # (Kmix, 2, 2) scale_tril
-
-        #     comp = dist.MultivariateNormal(loc=mu_k, scale_tril=L_k)  # batch (Kmix,), event (2,)
-        #     mix  = dist.MixtureSameFamily(dist.Categorical(probs=pi), comp)
-
-        #     numpyro.sample(f"cs_obs_{signal}", mix.expand([N]), obs=cs_vec)
-
-        #     choice = numpyro.sample(f"choice_{signal}", mix)  # shape (2,)
-        #     center_choice_z, scal_choice_z = choice[0], choice[1]
-
-        #     #map back to natural scale
-        #     center_choice = center_choice_z * sigma_cents + mu_cents
-        #     scal_choice   = jnp.expm1(scal_choice_z * sigma_scals + mu_scals)
-
-        #     centers.append(center_choice)
-        #     scales.append(scal_choice)
-        
-        # centers = jnp.hstack(centers)
-        # #scales  = jnp.hstack(scales) 
-
-
-
-
-        # y_paths = paths[-1,:][:,None]
-        # shifts  = jnp.arange(0,2*M+1)
-
-        # def compute_LL_for_shift(shift, y_paths, present):
-        #     idx     = jnp.arange(T, dtype=jnp.int32) + shift
-        #     #F_      = jnp.take(F_extended , idx , axis=0 )
-        #     F_      = jax.lax.dynamic_slice(F_extended, (shift, 0), (T, F_extended.shape[1]))
-
-        #     mu        = (F_/sF[None,:] + b)@Q + y_paths
-        #     mu_scaled = mu*scales + centers 
-            
-        #     loglike = dist.Normal( mu_scaled , eps_y ).log_prob( y_obs )
-        #     return jnp.sum(jnp.where(present, loglike, 0.0))  
-        # all_LLS = jax.vmap( lambda x: compute_LL_for_shift(x,y_paths,mask) )( shifts  )
-
-        # LLy = 0.5*jax.scipy.special.logsumexp( all_LLS/ (0.5) ) - jnp.log( shifts.size )
-        # numpyro.factor("LLy",LLy)
-
-        #numpyro.deterministic("Fy",Fy)
-
-
-
-        # # #--sample this for y so that its not annoying in predcition
-        # start_z = numpyro.sample("start_scale", dist.Normal(0,1).expand([1,L]) )
-        # innov_z = numpyro.sample("innov_scale", dist.Normal(0,1).expand([T-1,L])) #<--one for P and one for Q
-
-    # innovations =  (global_scale*local_scale).reshape(1,L) * jnp.vstack([ innov_z[::-1,:], start_z]) 
-
-        # y_path       = jnp.cumsum(innovations,0)[::-1,:] #<--this is  T X L
-        # numpyro.deterministic("y_path", y_path)
-        
- 
-
-        # def Kalmanfilter_Xt( carry, array, A, H, R, Q ):
-        #     m_, P_      = carry
-        #     yt,mask     = array   # S X 1
-
-        #     yt   = jnp.squeeze(yt)                        # ensure (S,)
-        #     mask = jnp.squeeze(mask).astype(y.dtype)  # ensure (S,)
-
-        #     #Reff = R + jnp.diag((1.0 - mask) * 10**-10)
-
-        #     #--assume we are at time t now
-        #     #--we assume that we carried foreward xt-1|yt-1
-            
-        #     #--p(yt | y1:t-1) = sum p(yt | xt) p(xt|y1:t-1) dxt
-            
-        #     #--xt|y1:t-1
-        #     mu_xt_t1 = A@m_                       # LX1
-        #     P_xt_t1  = A @ P_ @ A.T + Q           # LXL
-
-        #     #--p(yt|y1:t-1)
-        #     mu_yt_yt1 = H @ mu_xt_t1              # SX1
-        #     P_yt_yt1  = H @ P_xt_t1 @ H.T + R     # SXS
-
-        #     #--p(xt|y1:t) = p(xt|yt,y1:t-1) = p(yt|xt) p(xt|y1:t-1) or form p( xt_t1, yt ) and condition
-        #     eps2 = R[0, 0]                      # assumes R is eps2 * I
-        #     rinv = 1.0 / eps2
-
-        #     HtH = H.T @ H                       # (L,L)
-
-        #     # P^{-1} (small L×L)
-        #     Lp    = jnp.linalg.cholesky(P_xt_t1)
-        #     P_inv = jsp.cho_solve((Lp, True), jnp.eye(P_xt_t1.shape[0]))
-
-        #     # A = P^{-1} + H^T R^{-1} H  (L×L)
-        #     A_small = P_inv + rinv * HtH
-        #     LA      = jnp.linalg.cholesky(A_small + 1e-9 * jnp.eye(A_small.shape[0]))
-
-        #     # K = A^{-1} H^T R^{-1}  (L×S)
-        #     K   = jsp.cho_solve((LA, True), rinv * H.T)
-
-        #     #inv_P_yt_yt1 = jnp.linalg.inv(P_yt_yt1)
-        #     #K            = P_xt_t1 @ H.T @ inv_P_yt_yt1
-
-        #     mu_xt_t = mu_xt_t1 + K @ (yt - H@mu_xt_t1)
-        #     I       = jnp.eye(len(K))
-        #     P_xt_t  = P_xt_t1  - K @ H @ P_xt_t1
-
-        #     #log_prob = dist.MultivariateNormal( mu_yt_yt1, P_yt_yt1 ).mask(mask).log_prob( yt )
-
-        #     L = jnp.linalg.cholesky(P_yt_yt1)
-        #     innov      = yt - H@mu_xt_t1
-        #     Sinv_innov = jsp.cho_solve((L, True), innov)
-        #     logdetS    = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
-        #     d          = y.shape[0]
-        #     log_prob   = -0.5 * (d * jnp.log(2*jnp.pi) + logdetS + innov.T @ Sinv_innov)
-            
-        #     return (mu_xt_t, P_xt_t), log_prob
-
-        # def Kalmanfilter_Xt( carry, array, H, eps, Is, sigma,Il, sigma_HHT, sigmaH, Htsigma, S, HTH ):
-        #     m_, P_      = carry
-        #     yt,mask     = array   # S X 1
-
-        #     yt   = jnp.squeeze(yt)                    # ensure (S,)
-        #     mask = jnp.squeeze(mask).astype(y.dtype)  # ensure (S,)
-
-        #     #--assume we are at time t now
-        #     #--we assume that we carried foreward xt-1|yt-1
-            
-        #     #--Goal -> p(yt | y1:t-1) = sum p(yt | xt) p(xt|y1:t-1) dxt
-            
-        #     #--xt|y1:t-1
-        #     mu_xt_t1 = m_                       # LX1
-        #     P_xt_t1  = P_ + sigma*Il          # LXL
-
-        #     #--p(yt|y1:t-1)
-        #     mu_yt_yt1 = H @ m_
-        #     P_yt_yt1  = H@ P_ @ H.T + sigma_HHT + eps*Is     # SXS
-
-        #     #--p(xt|y1:t) = p(xt|yt,y1:t-1) = p(yt|xt) p(xt|y1:t-1) or form p( xt_t1, yt ) and condition
-        #     temp = jnp.linalg.inv(P_xt_t1) + (1./eps)*HTH
-        #     Sinv = (1./eps)*Is - (1./eps**2)*H@jnp.linalg.solve(temp, H.T )
-            
-        #     K    = (H@P_ + sigmaH).T @ Sinv  
-
-        #     innov   = (yt - H@m_)
-        #     mu_xt_t = m_ + K @ innov
-            
-        #     P_xt_t  = P_xt_t1  - K @ ( P_@H.T + Htsigma ).T
-
-        #     jitter = 1e-7
-
-        #     # --- stabilize (4x4 only)
-        #     P_pred = 0.5 * (P_xt_t1 + P_xt_t1.T) + jitter * Il
-        #     temp_  = 0.5 * (temp + temp.T)       + jitter * Il
-
-        #     Lp = jnp.linalg.cholesky(P_pred)   # 4x4
-        #     Lt = jnp.linalg.cholesky(temp_)    # 4x4
-
-        #     # logdet(S) = S*log(eps) + logdet(P_pred) + logdet(temp)
-        #     logdetP    = 2.0 * jnp.sum(jnp.log(jnp.diag(Lp)))
-        #     logdetTemp = 2.0 * jnp.sum(jnp.log(jnp.diag(Lt)))
-        #     logdetS    = S_past_total * jnp.log(eps) + logdetP + logdetTemp
-
-        #     # quad = innov^T S^{-1} innov
-        #     a = H.T @ innov                                # (4,)
-        #     temp_inv_a = jsp.cho_solve((Lt, True), a)
-        #     quad = (innov @ innov) / eps - (a @ temp_inv_a) / (eps**2)
-
-        #     log_prob = -0.5 * (S_past_total * jnp.log(2*jnp.pi) + logdetS + quad)
-           
-        #     return (mu_xt_t, P_xt_t), log_prob
-
-        # def Kalmanfilter_Xt(carry, array, H, eps, sigma, Il, HTH, jitter=1e-7, Sdim=None):
-        #     m_, P_, log_total = carry
-        #     yt, mask = array
-
-        #     yt = yt.reshape((Sdim,))
-        #     mask = mask.reshape((Sdim,)).astype(yt.dtype)
-
-        #     # Predict
-        #     P_pred = P_ + sigma * Il
-        #     P_pred = 0.5*(P_pred + P_pred.T) + jitter*Il
-
-        #     # Cholesky of P_pred (reuse for both update + low-rank likelihood)
-        #     Lp = jnp.linalg.cholesky(P_pred)
-
-        #     # --- Kalman update (4x4)
-        #     invP_pred = jsp.cho_solve((Lp, True), Il)
-        #     temp = invP_pred + (1.0/eps) * HTH
-        #     temp = 0.5*(temp + temp.T) + jitter*Il
-        #     Lt = jnp.linalg.cholesky(temp)
-
-        #     innov = yt - (H @ m_)
-        #     a = H.T @ innov
-
-        #     rhs = jnp.concatenate([Il, a[:, None]], axis=1)
-        #     sol = jsp.cho_solve((Lt, True), rhs)
-        #     P_post = sol[:, :Il.shape[0]]
-        #     # temp_inv_a = sol[:, -1]  # you can keep if needed
-
-        #     m_post = m_ + (1.0/eps) * (P_post @ a)
-
-        #     # --- Likelihood via LowRankMVN (no 33x33)
-        #     mu_y = H @ m_
-        #     U = H @ Lp
-        #     cov_diag = eps * jnp.ones((Sdim,))   # or eps*mask + big*(1-mask) if missing
-        #     log_prob = dist.LowRankMultivariateNormal(mu_y, U, cov_diag).log_prob(yt)
-
-        #     log_total = log_total + log_prob
-        #     return (m_post, P_post, log_total), None
-
-        # H   = P.T
-        # HTH = H.T @ H
-        # Il  = jnp.eye(L)
-        # res = X_fill - Fx@P
-        # sigma     = (global_scale * local_scale)**2
-        # eps       = eps**2
-
-        # (_, _, log_total),_ = jax.lax.scan(
-        #     lambda c, a: Kalmanfilter_Xt(c, a, H=H, eps=eps, sigma=sigma, Il=Il, HTH=HTH,Sdim=S_past_total),
-        #     init=(jnp.zeros((L,)), sigma * Il,0.),
-        #     xs=(res, maskX),
-        #     reverse=True
-        # )
-        # numpyro.factor("ll_x", log_total)
-
-
-        # H         = P.T
-        # 
-        # Is        = jnp.eye(S_past_total)
-        # 
-        # Il        = jnp.eye(L)
-        # sigma_HHT = H@ (sigma[:,None]*H.T)
-        # sigmaH    = sigma*H
-        # Htsigma   = sigmaH.T
-        # HTH       = H.T@H 
-        # _, logys = jax.lax.scan( lambda x,y: Kalmanfilter_Xt(x,y, H, eps, Is,sigma, Il, sigma_HHT, sigmaH, Htsigma, S_past_total, HTH )
-        #                          , init = ( jnp.zeros( (L,) ) , sigma*Il )
-        #                          , xs = (res[::-1,:] ,maskX[::-1,:]) )
-        
-        # numpyro.factor("ll_x", jnp.sum(logys) )
-
-        # H      = Q.T
-        # HTH    = H.T @ H
-        # Il     = jnp.eye(L)
-        # res    = (y_obs-centers.reshape(-1,1)/scales.reshape(-1,1)) -  (Fy@Q).reshape(-1,1)
-        # sigma  = (global_scale * local_scale)**2
-        # eps    = eps**2
-
-        # (_, _), logys = jax.lax.scan(
-        #     lambda c, a: Kalmanfilter_Xt(c, a, H=H, eps=eps, sigma=sigma, Il=Il, HTH=HTH, Sdim=1 ),
-        #     init=(jnp.zeros((L,)), sigma * Il),
-        #     xs=(res[::-1, :], mask[::-1, :]),
-        # )
-        # numpyro.factor("ll_y", jnp.sum(logys))
 
 
 if __name__ == "__main__":
