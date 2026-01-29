@@ -10,6 +10,11 @@ import jax.scipy.linalg as jsp
 
 import numpyro
 import numpyro.distributions as dist
+
+jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_infs", True)
+numpyro.enable_validation(True)
+
 from numpyro.infer import MCMC, NUTS, Predictive, init_to_median, DiscreteHMCGibbs
 from numpyro.infer.initialization import init_to_value
 from functools import partial
@@ -145,30 +150,137 @@ class puca( object ):
               ,centers          = None   
               ,forecast          = None):
 
+        def bspline_basis(x, knots, degree):
+            x = jnp.asarray(x, dtype=knots.dtype)
+            n_basis = knots.shape[0] - degree - 1
+            T = x.shape[0]
+
+            # degree-0 indicators
+            B = jnp.where(
+                (x[:, None] >= knots[:n_basis]) & (x[:, None] < knots[1:n_basis+1]),
+                1.0,
+                0.0,
+            )
+
+            # If x hits the right endpoint exactly, put mass in last basis
+            B = B.at[:, -1].set(jnp.where(x == knots[-1], 1.0, B[:, -1]))
+
+            zeros_col = jnp.zeros((T, 1), dtype=knots.dtype)
+
+            def body(d, Bcur):
+                kd  = jax.lax.dynamic_slice(knots, (d,),   (n_basis,))
+                kd1 = jax.lax.dynamic_slice(knots, (d+1,), (n_basis,))
+
+                k0 = knots[:n_basis]
+                k1 = knots[1:n_basis+1]
+
+                denom1 = kd  - k0
+                denom2 = kd1 - k1
+
+                zeros_col = jnp.zeros((T, 1), dtype=knots.dtype)
+                Bshift = jnp.concatenate([Bcur[:, 1:], zeros_col], axis=1)
+
+                # --- SAFE DIVISIONS (avoid /0 producing inf even if later masked) ---
+                denom1_safe = jnp.where(denom1 > 0, denom1, 1.0)
+                denom2_safe = jnp.where(denom2 > 0, denom2, 1.0)
+
+                w1 = (x[:, None] - k0) / denom1_safe
+                w2 = (kd1 - x[:, None]) / denom2_safe
+
+                term1 = jnp.where(denom1 > 0, w1 * Bcur, 0.0)
+                term2 = jnp.where(denom2 > 0, w2 * Bshift, 0.0)
+
+                return term1 + term2
+
+            B = jax.lax.fori_loop(1, degree + 1, body, B)
+            return B
+
+        def clamped_uniform_knots(lb, ub, n_basis, degree, dtype=jnp.float64):
+            # number of interior knots required for n_basis basis functions
+            n_int = n_basis - degree - 1
+            if n_int < 0:
+                raise ValueError("Need n_basis >= degree+1")
+
+            if n_int == 0:
+                interior = jnp.array([], dtype=dtype)
+            else:
+                # equally spaced interior knots, excluding endpoints
+                interior = jnp.linspace(lb, ub, n_int + 2, dtype=dtype)[1:-1]
+
+            knots = jnp.concatenate([
+                jnp.repeat(jnp.array(lb, dtype=dtype), degree + 1),
+                interior,
+                jnp.repeat(jnp.array(ub, dtype=dtype), degree + 1),
+            ])
+            return knots
+
+
         #--We need to build F as a set of P-splines that are rperesented as B @ beta
         Text,K          = B.shape
         T               = y_past.shape[0] 
         S_past_total    = y_past.shape[-1]
         S               = S_past_total + 1
         L               = IL.shape[0]
-
-        M               = 10
+        M               = 15
         
         #--This is a smoothness penalty 
-        #tau_diff = jnp.ones((L,))*0.1
+        base        = jnp.arange(0, T) 
 
-        sd_tau_diff = numpyro.sample("sd_tau_diff", dist.HalfNormal(1))
-        z__tau_diff = numpyro.sample("z__tau_diff", dist.Normal(0,1).expand([L]))
-        tau_diff    = jnp.exp(jnp.log( 0.1 ) + sd_tau_diff*z__tau_diff )
+        phi_raw         = numpyro.sample("phi_raw", dist.Normal(0, 1).expand([S]))
+        phi_shifts_free = 9.0 * jnp.tanh(phi_raw)
+        phi_shifts      = phi_shifts_free
+        
+        z          = numpyro.sample("z_log_a" , dist.Normal(0,1).expand([S]))
+        sd         = numpyro.sample("sd_log_a", dist.HalfNormal(0.2))  # small!
+        log_a_free = sd * z
+        a          = numpyro.deterministic("a",0.5 + (2-0.5)*jax.nn.sigmoid( log_a_free ))
+        
+        #--the S-1 shift is a shift of zero
+        phi_times = a*base[:,None] - phi_shifts
+        phi_times = jnp.clip(phi_times, -M,T+M)
+
+        xmin = -M
+        xmax = (T - 1) + M
+
+        n_basis = 15
+        degree  = 3
+
+        #knots = open_uniform_knots(xmin, xmax, n_basis=n_basis, degree=degree)
+        lb, ub    = -M , T+M
+
+        # integer interior knots but drop 2 (one near each boundary)
+        #knots_int  = jnp.arange(lb+1, ub, 1)   # (lb+2, ..., ub-2)
+        
+        # knots_full = jnp.concatenate([
+        #     jnp.repeat(jnp.array(lb, dtype=jnp.float64), degree+1),
+        #     knots_int.astype(jnp.float64),
+        #     jnp.repeat(jnp.array(ub, dtype=jnp.float64), degree+1),
+        # ])
+
+
+        knots_full = clamped_uniform_knots(lb, ub, n_basis=n_basis, degree=degree)
+
+        B_shifted = jax.vmap(lambda x: bspline_basis(x=x, knots=knots_full, degree=degree), in_axes=1)(phi_times)
+
+        ##B_shifted is SXTXL
+        B_x = B_shifted[:-1,...]#<--SXTXL
+        B_y = B_shifted[-1,...] #<--TXL
+
+        numpyro.deterministic("B_shifted", B_shifted)
+        numpyro.deterministic("B_y", B_y)
+
+        #--This is the beta vector
+        #sd_tau_diff = numpyro.sample("sd_tau_diff", dist.HalfNormal(0.2))
+        #z__tau_diff = numpyro.sample("z__tau_diff", dist.Normal(0,1).expand([L]))
+        tau_diff    =  numpyro.sample("sd_tau_diff", dist.HalfNormal( 1. ).expand([L])   ) #jnp.exp(jnp.log( 0.1 ) + sd_tau_diff*z__tau_diff )
 
         null        = 2
         U0          = Kp_U[:, :null]        
         Up          = Kp_U[:, null:]
         lp          = Kp_l[null:]
 
-        beta0       =  jnp.zeros( (U0.shape[1], L) ) #
-        
-        z_beta      = numpyro.sample("beta", dist.Normal(0,1).expand([lp.shape[0] ,L]) )
+        beta0       = jnp.zeros( (U0.shape[1], L) ) #numpyro.sample("beta0", dist.Normal(0,1).expand([U0.shape[1], L])) # 
+        z_beta      = numpyro.sample("z_beta", dist.Normal(0,1).expand([lp.shape[0] ,L]) )
         
         def produce_beta( tau_diff, z_beta, Up, lp ):
             on_diag    =   (lp/tau_diff**2) #+ 10**-6
@@ -177,114 +289,115 @@ class puca( object ):
         beta = jax.vmap( lambda x,y:produce_beta(x,y,Up,lp), in_axes = (0,1) )( tau_diff, z_beta  )
         beta = beta.T
 
-        beta = U0@beta0 + beta
+        beta = numpyro.deterministic("beta", U0@beta0 + beta)
 
-        X_shifts, y_shift = column_shifts[:S_past_total], column_shifts[-1]
-        
-        base        = jnp.arange(T)
-        
-        B_shifted   = B[ (M+base)[:,None] - X_shifts[None,:]  ]
-        B_shifted   = B_shifted - B_shifted[0,...][None,...] # <- enforce a zero start
-        
-        Fx          = B_shifted @ beta              #<--T X S X L
-        
-        mFx         = jnp.mean( Fx, axis=0 ).reshape(1, S-1, L)
-        sFx         = jnp.std(  Fx, axis=0 ).reshape(1, S-1, L)
-        Fx          = (Fx - mFx ) / sFx
+        Fx          = jnp.moveaxis( (B_x @ beta), [0,1], [1,0] )              #<--T X S X L   right now it comes in as S X T X L
         
         numpyro.deterministic("Fx",Fx)
        
         # #--P matrix so that X = Fnorm @ P
-        P_global_prec = numpyro.sample("P_global_prec" , dist.Gamma(2,2./4))
-        P_global_prec = 1./ jnp.sqrt(P_global_prec)
+        #P_global_prec = numpyro.sample("P_global_prec" , dist.Gamma(2,2./4))
+        #P_global_prec = 1./ jnp.sqrt(P_global_prec)
+        #P_local_prec   = numpyro.sample("P_local_prec" , dist.Gamma(2, 2.).expand([L,1]) )
         
-        P_local_prec   = numpyro.sample("P_local_prec" , dist.Gamma(2, 2.).expand([L,1]) )
-        P_local_prec   = Trans.OrderedTransform()(P_local_prec)
-        
-        gScale        = (P_global_prec * P_local_prec)
-
-        # n_tril = L * (L - 1) // 2
-
-        # if n_tril > 0:
-        #     r,c          = jnp.tril_indices(L,k=-1)
-        #     P_zeros      = jnp.zeros((L,L))
-        #     z_P_blk_raw  = numpyro.sample("z_P_blk_raw", dist.Normal(0,1).expand([ int(L*(L-1)/2) ] ))
-        #     P_blk        = gScale*( P_zeros.at[r,c].set(z_P_blk_raw) ) + IL
-        # else:
-        #     P_blk = IL
-
-        # P_rest       = numpyro.sample("P_rest", dist.Normal(0,1).expand([L, S - L]))
-        # P_rest       = gScale*P_rest
-        
-        # A            = jnp.concatenate([P_rest, P_blk], axis=1) #<--LXS
-        
-        # Q_scale = numpyro.sample("Q_scale", dist.Normal(0,1) )
-        # Q_scale = jnp.exp( Q_scale * jnp.log(2)/2 )
-
-        S_tot = S  # include target season too
+        gScale  = jnp.ones( (L,1) ) #(P_global_prec * P_local_prec)
+        S_tot   = S  # include target season too
                 
         # row scales (you already have gScale; shape (L,1) or (L,))
         row_scale = gScale.squeeze(-1)  # (L,)
 
         # exchangeable correlation across seasons
-        rho = numpyro.sample("rho_season", dist.Beta(5., 2.))  # encourages rho > 0
-        R = (1. - rho) * jnp.eye(S_tot) + rho * jnp.ones((S_tot, S_tot))
+        rho_season_raw = numpyro.sample("rho_season_raw", dist.Normal(0, 1))
+        rho_season     = 0.98 * jax.nn.sigmoid(1.+rho_season_raw)   # (0, 0.95)
+        numpyro.deterministic("rho_season", rho_season)
+
+        R      = (1. - rho_season) * jnp.eye(S_tot) + rho_season * jnp.ones((S_tot, S_tot))
         chol_R = jnp.linalg.cholesky(R + 1e-6 * jnp.eye(S_tot))  # jitter
 
         # optional per-season amplitude
-        col_scale = numpyro.sample("col_scale", dist.HalfNormal(1.).expand([S_tot]))  # (S,)
-        Lcol = jnp.diag(col_scale) @ chol_R  # this is D * L_R
+        col_scale = numpyro.sample("col_scale", dist.Normal(0,1).expand([S_tot]))
+        col_scale = col_scale*jnp.log(2)/2
+        Lcol      = jnp.diag(col_scale) @ chol_R  # this is D * L_R
 
         # iid standard normal
-        Z = numpyro.sample("Z_A", dist.Normal(0,1).expand([L, S_tot]))
+        Z         = numpyro.sample("Z_A", dist.Normal(0,1).expand([L, S_tot]))
 
         # A = S_row * Z * (D L_R)^T
-        A = row_scale[:, None] * (Z @ Lcol.T)  # (L,S)
+        A         = row_scale[:, None] * (Z @ Lcol.T)  # (L,S)
 
-        P = A[:,1:]
-        Q = A[:,0]
+        P         = A[:,1:]
+        Q         = A[:,0]
 
         numpyro.deterministic("A", A)
         numpyro.deterministic("P", P)
         numpyro.deterministic("Q", Q)
 
-        #--AR
-        eps         = 1.
+        #--need a long term local linear model
+        # local_level_sigma   = numpyro.sample("local_level_sigma", dist.HalfNormal(1)) 
+        # z_local_level       = numpyro.sample("local_level_z"    , dist.Normal(0,1).expand([T-1]))
+        # z_local_level       = z_local_level*local_level_sigma 
         
-        q            = numpyro.sample("qh", dist.Uniform(0.001,2).expand([S]))
-        path_scale   = 0.5+q
+        # local_trend_sigma   = numpyro.sample("local_trend_sigma", dist.HalfNormal(1)) 
+        # z_local_trend       = numpyro.sample("local_trend_z"    , dist.Normal(0,1).expand([T-1]))
+        # z_local_trend      = z_local_trend*local_trend_sigma
+
+        # def LocalLin(carry,array):
+        #     l,s      = carry
+        #     z_l, z_s = array
+
+        #     l_next = l + s + z_l
+        #     s_next = s + z_s
+        #     return (l_next,s_next), l_next
+        # _, season_level_deviation = jax.lax.scan(LocalLin, init = (0,0), xs = ( z_local_level, z_local_trend )  )
+        # season_level_deviation    = jnp.append(0, season_level_deviation).reshape(T,1)
+        #numpyro.deterministic("season_level_deviation", season_level_deviation)
+        #----------------------------------------------------------
+
+        #--AR
+        eps          = 1./10
+        
+        prec_log_ps = numpyro.sample("sd_log_path_scale", dist.Gamma(10, 0.10))
+        sd_log_ps   = 1./jnp.sqrt(prec_log_ps)
+        mu_log_ps   = numpyro.sample("mu_log_path_scale", dist.Normal(0, 1.0))  
+        z           = numpyro.sample("z_log_path_scale" , dist.Normal(0,1).expand([S]))
+        
+        log_ps     = (mu_log_ps-3) + sd_log_ps * z
+        
+        path_scale = jnp.exp(log_ps)
        
-        start_sigma = jnp.ones((S,))*0.0001
-        start_mean  = jnp.zeros( (S,) )  
+        start_sigma  = numpyro.sample("start_sigma", dist.HalfNormal(1./5))  
+        start_sigma  = jnp.ones((S,))*start_sigma
+        
+        qvar         = path_scale**2
 
-        Xtarget = jnp.hstack(y_past).reshape(T,S_past_total)
+        rho          = numpyro.sample("rho", dist.Uniform(0.01,1-0.01) )
 
-        Xtrend  = jnp.einsum("tsl,ls->ts",Fx,P) #<-TXS
-        Xtrend  = Xtrend #+ season_specific_intercept[None, :-1]
+        #start_intercept_center_sd = numpyro.sample("start_intercept_center_sd", dist.HalfNormal(1./5))         #jnp.ones( (S,) )
+        #start_intercept_center    = numpyro.sample("start_intercept_center"   , dist.Normal(0,1))              #jnp.ones( (S,) )
+        #z_start_intercept         = numpyro.sample("start_intercept"          , dist.Normal(0,1).expand([S,])) #jnp.ones( (S,) )
+        #start_intercept           = start_intercept_center + z_start_intercept*start_intercept_center_sd
+
+        start_intercept            = jnp.zeros((S,))
+        start_mean                 = jnp.zeros((S,)) 
+
+        Xtrend  = jnp.einsum("tsl,ls->ts",Fx,P) + start_intercept[:-1].reshape(1,S-1) #<-TXS
         numpyro.deterministic("Xtrend",Xtrend)
 
-        resid          = Xtarget - Xtrend
+        Xtarget      = jnp.hstack(y_past).reshape(T,S_past_total)
+        resid        = Xtarget - Xtrend
 
         Xmask        = jnp.isfinite(resid)
         resid_filled = jnp.where(Xmask, resid, 0.0)
 
-        rho          = 1
-
-        sd_r_pins = numpyro.sample("sd_r_pins" , dist.HalfNormal(1/2))
-        mn_r_pins = numpyro.sample("mn_r_pins" , dist.Normal(0,1))
-        z__r_pins = numpyro.sample("z__r_pins" , dist.Normal(0,1).expand([S]))
-        
-        r_pins    = 0.01 + jnp.exp( (mn_r_pins) + z__r_pins*sd_r_pins)
-
-        #--kalm likelihood here
-        def kf(carry, array, q, r, rho, r_pin):
+        # #--kalm likelihood here
+        def kf(carry, array, q, r, rho):
             mt,Pt    = carry
             yobs,mk  = array
 
-            m_pred = rho*mt
+            m_pred = rho*mt            #--This is mean from y (and also from x)
             p_pred = (rho**2)*Pt+q
 
-            y_p_pred = (rho**2)*Pt+q+r
+            y_p_pred = (rho**2)*Pt+q+r #--This is variance from y
             
             S = p_pred + r
             K = p_pred / S
@@ -297,148 +410,103 @@ class puca( object ):
             LOG2PI = jnp.log(2.0 * jnp.pi)
             ll     = mk*(-0.5 * (LOG2PI + jnp.log(S) + (innov**2) / S))
 
-            #pseudo-observation: z = 0 ~ N(m, P + r_pin)
-
-            S_pin = P_filt + r_pin
-            Kp    = P_filt / (S_pin)
+            mpost = m_filt
+            ppost = P_filt 
             
-            ll_pin = -0.5 * (jnp.log(2*jnp.pi) + jnp.log(S_pin) + (0-m_filt)**2 / (S_pin))
-
-            mpost = m_filt + Kp*(0-m_filt)
-            ppost = P_filt - Kp*P_filt
+            ll_ttl = ll
             
-            ll_ttl = ll + ll_pin
-            
-            return (mpost,ppost), (ll_ttl, m_pred, p_pred, mpost, ppost  )
-            #return (xp_y_E,xp_y_P), (ll, xp_E, xp_P, xp_y_E, xp_y_P  )
+            return (mpost,ppost), (ll_ttl, m_pred, p_pred, mpost, ppost, y_p_pred  )
         
-        _,(LL_xs,_,_,_,_) = jax.vmap( lambda path_scale_indiv, data, mask, start_m,start_s, r_pin : jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=path_scale_indiv**2,rho=rho, r_pin=r_pin**2) , init = ( start_m,start_s  ), xs = ( data, mask.squeeze() ), reverse=True   )
-                            , in_axes=(0,1,1,0,0,0) )(path_scale[:-1], resid_filled, Xmask, start_mean[:-1], start_sigma[:-1], r_pins[:-1])
+        _,(LL_xs,_,_,_,_,_) = jax.vmap( lambda path_scale_indiv, data, mask, start_m,start_s : jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=path_scale_indiv**2,rho=rho)
+                                                                                                           , init = ( start_m, start_s     )
+                                                                                                           , xs   = ( data, mask.squeeze() )   )
+                            , in_axes=(0,1,1,0,0) )(path_scale[:-1], resid_filled[::-1,:] , Xmask[::-1,:], start_mean[:-1], start_sigma[:-1] )
+        
         numpyro.factor( "LL_x", jnp.sum(LL_xs) )
+
+        #numpyro.deterministic("Xtarget", Xtarget)
+
+        # ll = dist.Normal(Xtrend, eps).log_prob(Xtarget)
+        # numpyro.deterministic("llx",ll)
 
         # with numpyro.handlers.mask(mask=Xmask):
         #     numpyro.sample("LLX", dist.Normal( Xtrend, eps ), obs = Xtarget )
 
-        eps_scale = 1
-        eps_y     = (eps*eps_scale) * scales
+        eps_y     = (2*eps) * scales
 
-        y_target = jnp.hstack(y_target).reshape(T,1)
+        ymask_list    = [ jnp.isfinite(y) for y in y_target]
+        y_target_list = [jnp.where(m, y, 0.0) for y, m in zip(y_target, ymask_list)]
+
+        y_target      = jnp.hstack(y_target_list).reshape(-1,)
+        ymask         = jnp.hstack(ymask_list).reshape(-1,)
         
-        ymask     = jnp.isfinite(y_target)
-
-        y_pin = r_pins[-1]
-        
-        #--shifting probabilities
-        #index_weights = index_weights+10**-2
-        #index_probs   = numpyro.sample( "index_weights", dist.Dirichlet( index_weights) )
-        #index_probs = jnp.clip(index_probs, 1e-12, 1.0)
-
-        #print(self.column_shifts)
-        #print(y_shift)
-        #index_probs = jnp.zeros( (len(index_weights)) )
-        #index_probs = index_probs.at[y_shift].set(1.)
-        
-        def from_shift_to_prob(shift, y_path_scale, y_pin):
-            B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
-            B_y      = B_y - B_y[0,:]
-
-            F_y      = (B_y@beta@Q).reshape(T,1)
-            y_trend      = F_y 
-            
-            resid        =  ((y_target - centers)/scales) - y_trend
-            ymask        =  jnp.isfinite(resid)
-            resid_filled =  jnp.where(ymask, resid, 0.0)
-
-            (m_last, P_last),(LL_y,xstep_E,xstep_P,xE,xP) = jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=y_path_scale**2,rho=rho,r_pin=y_pin**2) , init = ( start_mean[-1], start_sigma[-1] ), xs = ( resid_filled.squeeze(), ymask.squeeze() ), reverse=True)
-
-            return jnp.sum( LL_y ), xstep_E,xstep_P,xE,xP,m_last, P_last
-
-        start        = jnp.zeros((1,))  
-        shift        = y_shift
         y_path_scale = path_scale[-1]
-
         
-        B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
-        B_y      = B_y - B_y[0,:]
-
         F_y      = (B_y@beta@Q).reshape(T,1)
-        y_trend  =  F_y 
-        numpyro.deterministic("y_trend", y_trend)
-
-        shift                                   = y_shift  # deterministic shift value
-        LLY, mp1, Pp1, m_t, P_t, m_last, P_last = from_shift_to_prob(shift, y_path_scale, y_pin)
-        numpyro.factor( "LLY", LLY )
-
-        # shift = y_shift
         
-        # B_y      = B[M+base-shift,:] #<--   y_target is the last shifted index
-        # B_y      = B_y - B_y[0,:]
+        y_trend  =  F_y + start_intercept[-1]
+        numpyro.deterministic("y_trend",y_trend)
+
+        resid        =  ((y_target.reshape(T,1) - centers)/scales) - y_trend
+        ymask = ymask.reshape(T,1)
         
-        # Fy      = (B_y@beta).reshape(T,L)
+        resid_filled =  jnp.where(ymask, resid, 0.0)
 
-        # mFy         = jnp.mean( Fy, axis=0 ).reshape(1,L)
-        # sFy         = jnp.std( Fy, axis=0 ).reshape(1,L)
-        # Fy          = (Fy - mFy ) / sFy
+        resid_filled_rev = resid_filled[::-1]
+        ymask_rev        = ymask[::-1] 
+        
+        #--The end is time 0
+        (m_last, P_last),(LL_y,mp1, Pp1, m_t, P_t, y_p_pred) = jax.lax.scan( lambda x,y: kf(x,y,r=eps**2,q=y_path_scale**2,rho=rho)
+                                                                                              , init  = ( start_mean[-1], start_sigma[-1] )
+                                                                                              , xs    = ( resid_filled_rev.squeeze(), ymask_rev.squeeze() ) )
+ 
+        numpyro.factor("LLY", jnp.sum(LL_y))
 
-        # Fy = (Fy @ Q).reshape(T,1)
-        # y_trend      = numpyro.deterministic("y_trend", Fy )
+        numpyro.deterministic("mp1"         , mp1)
+        numpyro.deterministic("Pp1"         , Pp1)
+        numpyro.deterministic("m_t"         , m_t)
+        numpyro.deterministic("P_t"         , P_t)
+        numpyro.deterministic("m_last"      , m_last)
+        numpyro.deterministic("P_last"      , P_last)
+        numpyro.deterministic("y_p_pred_rev", y_p_pred)
+
+        # z_y    = numpyro.sample("z_y", dist.Normal(0,1).expand([T-1]))
+        # y_path = jnp.cumsum( jnp.append( start_mean[-1], z_y*y_path_scale ) )[::-1]
+
+        # y_trend = (y_trend.reshape(-1,) + y_path.reshape(-1,))*scales + centers
 
         # with numpyro.handlers.mask(mask=ymask):
-        #     numpyro.sample("LLY", dist.Normal( y_trend, eps_y ), obs = y_target )
-        
+        #      numpyro.sample("LLY", dist.Normal( y_trend ,  eps_y ), obs = y_target )
        
         if forecast:
-            innov_z      = numpyro.sample("new_innov_z"    , dist.Normal(0,1).expand([ T ])) #<--one for P and one for Q
-            eps          = y_path_scale*innov_z
+            #numpyro.sample("y_pred", dist.Normal(y_trend, eps_y))
 
-            xT           = numpyro.sample("xT", dist.Normal(m_t[-1], jnp.sqrt(P_t[-1]) ))
-            
+            innov_z      = numpyro.sample("new_innov_z"    , dist.Normal(0,1).expand([ T-1 ])) #<--one for P and one for Q
+            eps          = innov_z
+
+            xT           = numpyro.sample("xT", dist.Normal(m_t[-1], jnp.sqrt(P_t[-1]+10**-6) )) #<--this is time zero
             def step_ffbs(x_next, inputs):
                 eps_t, m_t, P_t, mp1, Pp1 = inputs  # all scalars
-                J    = rho * P_t / (Pp1 )
+                J    = rho * P_t / (Pp1+10**-6 )
                 mean = m_t + J * (x_next - mp1)
+
                 var  = P_t - (J * J) * Pp1
-                #var  = jnp.maximum(var, tiny)
+                var  = jnp.maximum(var, 10**-6)
+                
                 x_t  = mean + jnp.sqrt(var) * eps_t
                 return x_t, x_t
 
-            inputs_rev = (eps[:-1][::-1], m_t[:-1][::-1], P_t[:-1][::-1], mp1[:-1][::-1], Pp1[:-1][::-1])
-            _, xs_rev  = jax.lax.scan(step_ffbs, init=xT, xs=inputs_rev)
-            x_path     = jnp.concatenate([xs_rev[::-1], xT[None]], axis=0)
+            inputs = (eps,m_t[1:],P_t[1:],mp1[:-1],Pp1[:-1])
+            _, xs_rev  = jax.lax.scan(step_ffbs, init=xT, xs=inputs, reverse=True)
+            x_path     = jnp.concatenate([  xs_rev[::-1], xT[None] ], axis=0)
+
+            numpyro.deterministic("sxT"    , xT)
+            numpyro.deterministic("xs_rev", xs_rev)
+            numpyro.deterministic("x_path", x_path)
             
             numpyro.sample( "y_pred", dist.Normal( (y_trend+x_path.reshape(T,1) )*scales + centers, eps_y))
-                           
-            #--trned component
-            #shift_post = jax.nn.softmax(logw)              # normalized responsibilities
-            #shift_idx   = numpyro.sample("shift", dist.Categorical(shift_post) )
-            #shift       = shifts[shift_idx]
-            # shift = y_shift
-
-            #blarp
             
-            # B_y      = B[M + base - shift,:]
-            # B_y      = B_y - B_y[0,:] 
-            
-            # F_y      = numpyro.deterministic("F_y", (B_y@beta@Q).reshape(T,1))
-
-            # #--noise path component
-            
-
-            # start        = numpyro.sample("pred_start", dist.Normal( start_mean[-1], start_sigma[-1])).reshape(1,1)
-            # 
-            # numpyro.deterministic("innovations",innovations)
-
-            # y_path = numpyro.sample( "y_path", dist.Normal(ye,yp)  ) 
-            
-            # y  = F_y + season_specific_intercept[-1] +  y_path[:,None]
-            # yhat_    = y *scales + centers
-
-            # #numpyro.deterministic("y_trend_pred", y_trend*scales + centers)
-            # numpyro.sample("y_pred", dist.Normal(yhat_, eps_y) )
-
-            # numpyro.deterministic("path_scale", path_scale)
-            # numpyro.deterministic("y_path_scale", y_path_scale)
-
+            # #----------------------------------------------------------------------------------------
 
     def estimate_factors(self,D):
         u, s, vt            = np.linalg.svd(D, full_matrices=False)
@@ -472,18 +540,31 @@ class puca( object ):
             out[inb] = y[idx[inb]]
             return out
 
+        def best_shift_corr(col, ref, max_shift=10, min_overlap=15):
+            best = (-np.inf, 0)
+            for d in range(-max_shift, max_shift+1):
+                sh = apply_shift_1d(col, d)
+                mask = np.isfinite(sh) & np.isfinite(ref)
+                n = mask.sum()
+                if n < min_overlap:
+                    continue
+                x = sh[mask]; y = ref[mask]
+                x = (x - x.mean()) / (x.std() + 1e-8)
+                y = (y - y.mean()) / (y.std() + 1e-8)
+                corr = np.mean(x * y)
+                if corr > best[0]:
+                    best = (corr, d)
+            return best[1]
+
         column_shifts = []
         for n,column in enumerate(y_curves.T):
-            sses = []
-            for shift in np.arange(-10,10+1,1):
-                shifted_column = apply_shift_1d(column, shift)
-                sses.append( (np.nansum( (shifted_column - y_candidate)**2 ) , shift) )
-            best = sorted(sses)[0][-1]
-
+            best = best_shift_corr(column, y_candidate)
             column_shifts.append(best)
+
         return column_shifts
 
-    def build_basis_for_F(self):
+
+    def build_basis_for_F(self, phi_times, both=False):
         # time grid
         T = self.T
         M = self.M
@@ -518,35 +599,106 @@ class puca( object ):
             )
 
         #--Choose fixed spline settings and pad them from -M to M for a total of 2M+1 potential reference points (dont forget zero)
-        lb, ub = -M, (T-1) + M
+        lb, ub = -M, (T) + M
         t      = np.arange(lb,ub+1)
         knots  = np.arange(lb, ub, 1)[1:] #was originally 2
 
-        B            = bs_basis_numpy(t,knots,lb,ub)
+        def clamped_uniform_knots(lb, ub, n_basis, degree, dtype=jnp.float64):
+            # number of interior knots required for n_basis basis functions
+            n_int = n_basis - degree - 1
+            if n_int < 0:
+                raise ValueError("Need n_basis >= degree+1")
+
+            if n_int == 0:
+                interior = jnp.array([], dtype=dtype)
+            else:
+                # equally spaced interior knots, excluding endpoints
+                interior = jnp.linspace(lb, ub, n_int + 2, dtype=dtype)[1:-1]
+
+            knots = jnp.concatenate([
+                jnp.repeat(jnp.array(lb, dtype=dtype), degree + 1),
+                interior,
+                jnp.repeat(jnp.array(ub, dtype=dtype), degree + 1),
+            ])
+            return knots, interior
+
+        def bspline_basis(x, knots, degree):
+            x = jnp.asarray(x, dtype=knots.dtype)
+            n_basis = knots.shape[0] - degree - 1
+            T = x.shape[0]
+
+            # degree-0 indicators
+            B = jnp.where(
+                (x[:, None] >= knots[:n_basis]) & (x[:, None] < knots[1:n_basis+1]),
+                1.0,
+                0.0,
+            )
+
+            # If x hits the right endpoint exactly, put mass in last basis
+            B = B.at[:, -1].set(jnp.where(x == knots[-1], 1.0, B[:, -1]))
+
+            zeros_col = jnp.zeros((T, 1), dtype=knots.dtype)
+
+            def body(d, Bcur):
+                kd  = jax.lax.dynamic_slice(knots, (d,),   (n_basis,))
+                kd1 = jax.lax.dynamic_slice(knots, (d+1,), (n_basis,))
+
+                k0 = knots[:n_basis]
+                k1 = knots[1:n_basis+1]
+
+                denom1 = kd  - k0
+                denom2 = kd1 - k1
+
+                zeros_col = jnp.zeros((T, 1), dtype=knots.dtype)
+                Bshift = jnp.concatenate([Bcur[:, 1:], zeros_col], axis=1)
+
+                # --- SAFE DIVISIONS (avoid /0 producing inf even if later masked) ---
+                denom1_safe = jnp.where(denom1 > 0, denom1, 1.0)
+                denom2_safe = jnp.where(denom2 > 0, denom2, 1.0)
+
+                w1 = (x[:, None] - k0) / denom1_safe
+                w2 = (kd1 - x[:, None]) / denom2_safe
+
+                term1 = jnp.where(denom1 > 0, w1 * Bcur, 0.0)
+                term2 = jnp.where(denom2 > 0, w2 * Bshift, 0.0)
+
+                return term1 + term2
+
+            B = jax.lax.fori_loop(1, degree + 1, body, B)
+            return B
+
+        knots_full, knots_interior = clamped_uniform_knots(lb, ub, n_basis=15, degree=3)
+        
+        #B                = bs_basis_numpy(t,knots,lb,ub)
+        B                 = bspline_basis(t,knots_full,3)
 
         #--Normalize the basis 
-        D            = jnp.std(B, 0) 
-        Sb           = jnp.diag( D )
-        Sbinv        = jnp.diag(1./D)
+        #D            = jnp.std(B, 0) 
+        #Sb           = jnp.diag( D )
+        #Sbinv        = jnp.diag(1./D)
 
-        B_norm       = B @ Sbinv
+        #B_norm       = B @ Sbinv
 
-        self.B      = jnp.array(B_norm)    #<--Normalized B
-        self.Sb     = Sb        #<--Scaling matrix for B
+        self.B      = jnp.array(B)    #<--Normalized B
+        self.Sb     = 1#Sb        #<--Scaling matrix for B
 
         #--While we're here we should compute the matrix of second differences (D) and the penalty matrix Kp
         D          = jnp.diff(jnp.diff(jnp.eye(B.shape[-1]),axis=0),axis=0)
-        #D         = jnp.diff(D,axis=0)
         
         Kp         = D.T@D
         
         self.Kp                 = Kp
         self.Kp_l, self.Kp_U    = jnp.linalg.eigh(Kp)
 
-        return B_norm, Kp
+        if both:
+            return B,Kp
+            #return B_norm, Kp
+        else:
+            return B
+            #B_norm
 
     def fit(self
-            , M                          = 10
+            , M                          = 15
             , estimated_num_components_y = None):
 
         y, Y, X     = self.y, self.Y, self.X
@@ -580,7 +732,7 @@ class puca( object ):
             y_counts[ M - shift ]+=1
         self.index_weights = y_counts
 
-        B,_ = self.build_basis_for_F()
+        B,_ = self.build_basis_for_F( phi_times = jnp.arange(self.T) ,  both=True)
 
         model      = self.model
         copies     = self.copies
@@ -621,7 +773,7 @@ class puca( object ):
         #     ,init_loc_fn=init_to_median(num_samples=100)
         # )
  
-        # optimizer = ClippedAdam(step_size= 4*10**-5, clip_norm=1)  # common starting point: 1e-3 to 1e-2
+        # optimizer = ClippedAdam(step_size= 1*10**-3, clip_norm=1)  # common starting point: 1e-3 to 1e-2
         # loss      = Trace_ELBO(num_particles=3)
 
         # svi = SVI(self.model, guide, optimizer, loss)
@@ -661,22 +813,22 @@ class puca( object ):
         
         #--MCMC start
         dense_blocks = [
-            ("z_y",),
-            ("beta","alpha"),                            # spline shape + smoothness + level
-            ("z_P_blk_raw", "P_global_prec", "P_local_prec"),          # P hierarchy
-            ("Qraw", "Q_global_prec"),
-            ("intercept_perc", "season_specific_intercept"),
-            ("global_prec", "local_prec")#,"innov_z"),  # RW scales (optionally add "start_z")
+            #("z_beta",)
+            #("local_level_sigma","local_trend_sigma")
+            #("P_global_prec", "P_local_prec")
+            #,("rho_season_raw","col_scale")
+            #,("phi_raw","z_log_a","sd_log_a")
+            
         ]
         
         nuts_kernel = NUTS(self.model#neutra_model
                            , init_strategy = init_to_median(num_samples=100)
-                           , dense_mass = [("beta",)]
+                           #, dense_mass = dense_blocks
                            ,  find_heuristic_step_size=True)     
         kernel      = nuts_kernel 
         mcmc        = MCMC(kernel
-                    , num_warmup     = 2000
-                    , num_samples    = 2500
+                    , num_warmup     = 1000
+                    , num_samples    = 1000
                     , num_chains     = 1
                     , jit_model_args = False)
 
@@ -716,12 +868,12 @@ class puca( object ):
         #                        , guide=self.guide
         #                        , params=self.params
         #                        , num_samples=5000
-        #                        , return_sites  = ["y_pred","y_trend_pred","Fx","F_y","path_scale","y_path_scale","innovations","eps_kf","kappa","log_kappa_sigma","log_kappa_mu"] )
+        #                        , return_sites  = ["y_pred"] )
         #--SVI END
 
         #--MCMC START
         predictive = Predictive(self.model,posterior_samples = self.posterior_samples
-                                , return_sites               = list(self.posterior_samples.keys()) + ["y_pred","y_trend_pred"] )
+                                , return_sites               = list(self.posterior_samples.keys()) + ["y_pred","xT","xs_rev","x_path"] )
         #--MCMC END
 
         rng_key    = jax.random.PRNGKey(100915)
