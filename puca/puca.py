@@ -14,7 +14,10 @@ numpyro.enable_validation(True)
 from numpyro.infer import MCMC, NUTS, Predictive, SVI, Trace_ELBO, init_to_median
 from numpyro.infer.autoguide import AutoDelta
 
+# Substeps per observation interval (e.g. week). dt = 1/n_substeps; total time still T.
 class puca( object ):
+    
+    euler_substeps = 1
 
     def __init__(self
                  , y                 = None
@@ -130,6 +133,7 @@ class puca( object ):
     @staticmethod
     def model( y          = None
               ,X          = None
+              ,anchor     = None 
               ,global_mu  = None
               ,global_std = None
               ,forecast   = False):
@@ -141,6 +145,7 @@ class puca( object ):
         #W     = B.shape[-1]
         L    = 1
 
+        
         def sir_euler_incidence(
             S0,
             I0,
@@ -148,36 +153,28 @@ class puca( object ):
             beta,
             gamma,
             T,
-            dt=1.0
+            n_substeps,
         ):
             """
             Euler integration of an SIR model with cumulative infections C.
 
-            States:
-                dS/dt = -beta * S * I / N
-                dI/dt =  beta * S * I / N - gamma * I
-                dR/dt =  gamma * I
-                dC/dt =  beta * S * I / N
+            Uses n_substeps per observation interval (dt = 1/n_substeps) so the
+            same calendar length T is covered with finer steps. Cumulative C is
+            then read off at the original integer times t = 0,1,...,T (indices
+            0, n_substeps, 2*n_substeps, ...); incidence per interval is the
+            difference (equivalent to summing sub-step dC, since C is integrated
+            linearly in the Euler steps).
 
-            Returns:
-                jnp.diff(C), i.e. incident infections over each Euler step.
-
-            Parameters
-            ----------
-            S0, I0, R0 : float
-                Initial compartment values.
-            beta : float
-                Transmission rate.
-            gamma : float
-                Recovery rate.
-            T : int
-                Number of Euler steps.
-            dt : float
-                Step size.
+            Returns
+            -------
+            inc : length T
+                New infections over each original time interval [t, t+1).
             """
             N = S0 + I0 + R0
             C0 = 0.0
-            beta = jnp.repeat(beta,T)
+            n_steps = T * n_substeps
+            dt = 1.0 / float(n_substeps)
+            beta = jnp.repeat(beta, n_steps)
 
             def step_fn(state, array):
                 S, I, R, C = state
@@ -194,111 +191,154 @@ class puca( object ):
                 return (S_next, I_next, R_next, C_next), C_next
 
             init_state = (S0, I0, R0, C0)
-            _, C_path = jax.lax.scan(step_fn, init_state, xs=beta )#, length=T)
+            _, C_path = jax.lax.scan(step_fn, init_state, xs=beta)
 
-            # prepend C0 so diff gives length T
-            C_path = jnp.concatenate([jnp.array([C0]), C_path])
-
-            return jnp.diff(C_path)
+            C_path        = jnp.concatenate([jnp.array([C0]), C_path])
+            #idx           = jnp.arange(T + 1, dtype=jnp.int32) * int(n_substeps)
+            #C_at_integers = C_path[idx]
+            #inc           = jnp.diff(C_at_integers)
+            inc           = jnp.diff(C_path)
+            return inc
 
         #T,S = y.shape
 
-        M=1
-        tau_grid = jnp.linspace( 0,2, 200) # The "center" here is 1
-
         # ------------------------------------------------------------
-        # hierarchical season effects
+        # Hierarchical repo: repo_s[s] ~ lognormal(log(repo_global), repo_scale_local)
         # ------------------------------------------------------------
-        mu_log_a  = numpyro.sample("mu_log_a" , dist.Normal(0.0, 1.0))
-        mu_log_b  = numpyro.sample("mu_log_b" , dist.Normal(0.0, 1.0))
-        tau_log_a = numpyro.sample("tau_log_a", dist.HalfNormal(0.5 ))
-        tau_log_b = numpyro.sample("tau_log_b", dist.HalfNormal(0.5 ))
-
-        mu_b      = numpyro.sample("mu_b"     , dist.Normal(0.0, 0.1))
-        tau_b     = numpyro.sample("tau_b"    , dist.HalfNormal(0.5 ))
-
-        #main_var               = numpyro.sample("main_var", dist.Dirichlet(5*jnp.array([0.90,0.08,0.02])))
-        spacing                = jnp.sqrt(tau_grid[1]) #<--this is only bc i start at zero and take same size increments.
-
         logit_I0 = numpyro.sample("logit_I0", dist.Normal(-4.0, 1.0))
         I0       = jax.nn.sigmoid(logit_I0)
         S0       = 1.0 - I0
 
-        repo_a_global       = numpyro.sample("repo_a_global", dist.Gamma(2,1))
-        repo_b_global       = numpyro.sample("repo_b_global", dist.Gamma(2,1))
-        repo_a_scale_local  = numpyro.sample("repo_a_scale_local",dist.HalfNormal(1./2))
-        repo_b_scale_local  = numpyro.sample("repo_b_scale_local",dist.HalfNormal(1./2))
-        with numpyro.plate("season", S):
-            z_repo_a   = numpyro.sample( "z_repo_a", dist.Normal(0,1)  )
-            z_repo_b   = numpyro.sample( "z_repo_b", dist.Normal(0,1)  )
-        repo_a = jnp.exp(jnp.log(repo_a_global) + repo_a_scale_local*z_repo_a)
-        repo_b = jnp.exp(jnp.log(repo_b_global) + repo_b_scale_local*z_repo_b)
+
+        #--For A
+        repo_global = numpyro.sample("repo_global", dist.Gamma(2, 1.0))
+        repo_scale_local = numpyro.sample("repo_scale_local",dist.HalfNormal(0.10))
+        with numpyro.plate("season_repo", S):
+            z_repo = numpyro.sample("z_repo", dist.Normal(0.0, 1.0))
+        repo_s = jnp.exp(jnp.log(repo_global) + repo_scale_local * z_repo)
+        numpyro.deterministic("repo_s", repo_s)
+
+        gamma = numpyro.sample("gamma", dist.Gamma(6, 6))
+        beta_s = repo_s * gamma
+
+        inca = jax.vmap(
+            lambda b: sir_euler_incidence(
+                S0=S0,
+                I0=I0,
+                R0=0.0,
+                beta=b,
+                gamma=gamma,
+                T=T,
+                n_substeps=puca.euler_substeps), in_axes=0)(beta_s)
+        numpyro.deterministic("inca", inca)
+
+        #--For B
+        repo_globalB = numpyro.sample("repo_globalB", dist.Gamma(2, 1.0))
+        repo_scale_localB = numpyro.sample("repo_scale_localB",dist.HalfNormal(0.1))
+        with numpyro.plate("season_repo", S):
+            z_repoB = numpyro.sample("z_repoB", dist.Normal(0.0, 1.0))
+        repo_sB = jnp.exp(jnp.log(repo_globalB) + repo_scale_localB * z_repoB)
+        numpyro.deterministic("repo_sB", repo_sB)
+
+        gammaB = numpyro.sample("gammaB", dist.Gamma(3, 3))
+        beta_sB = repo_sB * gammaB
+
+        incb = jax.vmap(
+            lambda b: sir_euler_incidence(
+                S0=S0,
+                I0=I0,
+                R0=0.0,
+                beta=b,
+                gamma=gammaB,
+                T=T,
+                n_substeps=puca.euler_substeps), in_axes=0)(beta_sB)
+        numpyro.deterministic("incb", incb)
+
+        #--time warping
+        peaks       = jnp.nanargmax(X, axis=0)
+        peak_deltas = (T - 2 * peaks)/2. #<-- pretty sure this should be (T-2*peak)/2
+
+        peakb_deltas = anchor
+
+        #print(jnp.nanmean(peak_deltas))
+        #print(jnp.nanmean(peakb_deltas))
         
-        gamma             = numpyro.sample("gamma",dist.Gamma(2,1))
 
-        beta_a            = repo_a*gamma
-        beta_b            = repo_b*gamma
+        delta_std = numpyro.sample("delta_std"    , dist.HalfNormal(1.0))
+        delta_z   = numpyro.sample("delta_fit_z"  , dist.Normal(0.0, 1.0))
+        delta     = jnp.mean(peak_deltas) + delta_z * delta_std
+        deltas    = numpyro.deterministic("deltas", jnp.append(peak_deltas, delta))
+        
 
+        delta_stdB = numpyro.sample("delta_stdB"     , dist.HalfNormal(1.0))
+        delta_zB   = numpyro.sample("delta_fit_zB"   , dist.Normal(0.0, 1.0))
+        deltaB     = jnp.nanmean(peakb_deltas) + delta_zB * delta_stdB
+
+        #deltaB = numpyro.sample("deltaB", dist.Uniform(-0.5*T,0.5*T))
+        
+        deltasB    = numpyro.deterministic("deltasB" , jnp.append(peakb_deltas,  deltaB))
+
+
+        calendar_time = jnp.arange(0, T)
+        original_taus = (2 * calendar_time + T + 0) / (2 * T)
+
+        #--For A
+        ha = (2 * calendar_time[:, None] + T + deltas[None, :]) / (2 * T)
+        ha = numpyro.deterministic("ha", ha)
+
+        main_trenda = jax.vmap( lambda hh, inc_row: jnp.interp(hh, original_taus, inc_row),in_axes=(1, 0),)(ha, inca)
+        main_trenda = main_trenda.T
+        numpyro.deterministic("main_trenda", main_trenda)
+
+        #--For B
+        hb = (2 * calendar_time[:, None] + T + deltasB[None, :]) / (2 * T)
+        hb = numpyro.deterministic("hb", hb)
+        
+        main_trendb = jax.vmap( lambda hh, inc_row: jnp.interp(hh, original_taus, inc_row),in_axes=(1, 0),)(hb, incb)
+        main_trendb = main_trendb.T
+        numpyro.deterministic("main_trendb", main_trendb)
+
+
+        mu_log_a  = numpyro.sample("mu_log_a", dist.Normal(0.0, 1.0))
+        tau_log_a = numpyro.sample("tau_log_a", dist.HalfNormal(0.5))
+
+        mu_log_b  = numpyro.sample("mu_log_b", dist.Normal(0.0, 1.0))
+        tau_log_b = numpyro.sample("tau_log_b", dist.HalfNormal(0.5))
        
-        inc_a = jax.vmap( lambda beta: sir_euler_incidence(S0=S0, I0=I0, R0 = 0., beta=beta, gamma = gamma, T = T, dt=1) , in_axes=0 )(beta_a)
-        inc_b = jax.vmap( lambda beta: sir_euler_incidence(S0=S0, I0=I0, R0 = 0., beta=beta, gamma = gamma, T = T, dt=1) , in_axes=0 )(beta_b)
-
-        print(inc_a.shape)
-        numpyro.deterministic("inc_a",inc_a)
-        numpyro.deterministic("inc_b",inc_b)
-
-        peaks       = jnp.nanargmax( X, axis=0 )
-        peak_deltas = (T+1) - 2*peaks
+        mu_int      = numpyro.sample("mu_int", dist.Normal(0.0, 0.1))
+        tau_int     = numpyro.sample("tau_int", dist.HalfNormal(0.5))
         
-        delta_a  = numpyro.sample("delta_a", dist.Uniform( -T, T ) )
-        delta_b  = numpyro.sample("delta_b", dist.Uniform( -T, T ) )
-        
-        deltas_a = numpyro.deterministic( "deltas_a", jnp.append( peak_deltas, delta_a))
-        deltas_b = numpyro.deterministic( "deltas_b", jnp.append( peak_deltas, delta_b))
+        with numpyro.plate("season_ab", S):
+            #--For A
+            z_log_a = numpyro.sample("z_log_a", dist.Normal(0.0, 1.0))
+            log_a_s = mu_log_a + tau_log_a * z_log_a
+            a_s     = numpyro.deterministic("a_s", jnp.exp(log_a_s))
 
-        numpyro.sample("delta_a_fit", dist.Normal( jnp.mean(peak_deltas), jnp.std(peak_deltas) ), obs = delta_a )
-        numpyro.sample("delta_b_fit", dist.Normal( jnp.mean(peak_deltas), jnp.std(peak_deltas) ), obs = delta_b )
+            #--For B
+            z_log_b = numpyro.sample("z_log_b", dist.Normal(0.0, 1.0))
+            log_b_s = (mu_log_b-1) + tau_log_b * z_log_b
+            b_s     = numpyro.deterministic("b_s", jnp.exp(log_b_s))
 
-        calendar_time = jnp.arange(0,T)
-        original_taus = (2*calendar_time + T + 0)/(2*T)
-        
-        h_a             = (2*calendar_time[:,None]+T+deltas_a[None,:] )/(2*T)  #--maps from t to tau and is TXS
-        h_b             = (2*calendar_time[:,None]+T+deltas_b[None,:] )/(2*T)  #--maps from t to tau and is TXS
-        h_a             = numpyro.deterministic( "h_a", h_a )
-        h_b             = numpyro.deterministic( "h_b", h_b )
-        
-        main_trend_a = jax.vmap(lambda h,inc: jnp.interp( h, original_taus , inc  ), in_axes = (1,0))( h_a, inc_a )
-        main_trend_b = jax.vmap(lambda h,inc: jnp.interp( h, original_taus , inc  ), in_axes = (1,0))( h_b, inc_b )
-        
-        main_trend_a = main_trend_a.T
-        main_trend_b = main_trend_b.T
-        numpyro.deterministic("main_trend_a", main_trend_a)
-        numpyro.deterministic("main_trend_b", main_trend_b)
+            #--intercept
+            z_int     = numpyro.sample("int_b"       , dist.Normal(0.0, 1.0))
+            int_s     = numpyro.deterministic("int_s", mu_int + tau_int * z_int)
 
+        mu = numpyro.deterministic("mu", (a_s[None, :] * main_trenda) +  (b_s[None, :] * main_trendb)  + int_s[None, :])
+
+        trend = mu
+
+        # Hierarchical observation noise (per season)
+        #mu_log_sigma = numpyro.sample("mu_log_sigma", dist.Normal(-2.0, jnp.sqrt(2)/2))
+        mu_log_sigma = numpyro.sample("mu_log_sigma", dist.HalfNormal(1))
         with numpyro.plate("season", S):
-            z_log_a_a = numpyro.sample("z_log_a_a", dist.Normal(0.0, 1.0))
-            z_log_a_b = numpyro.sample("z_log_a_b", dist.Normal(0.0, 1.0))
-            log_a_a   = mu_log_a + tau_log_a * z_log_a_a
-            log_a_b   = mu_log_b + tau_log_b * z_log_a_b
-            
-            a_a       = numpyro.deterministic("a_a", jnp.exp(log_a_a))
-            a_b       = numpyro.deterministic("a_b", jnp.exp(log_a_b))
+            tau_log_sigma = numpyro.sample("tau_log_sigma", dist.HalfNormal( 0.1/2 ))
+            #tau_log_sigma = numpyro.sample("tau_log_sigma", dist.StudentT(df=3,loc=0,scale=1./10))
+            #sigma         = (mu_log_sigma + jnp.abs(tau_log_sigma))
+            sigma         = (mu_log_sigma + tau_log_sigma)
+            #z_sigma = numpyro.sample("z_sigma", dist.Normal(0,1))
+            #sigma   = numpyro.deterministic("sigma_s", jnp.exp(mu_log_sigma + tau_log_sigma*z_sigma))
 
-            z_b     = numpyro.sample("z_b"     , dist.Normal(0.0, 1.0))
-            b       = numpyro.deterministic("b", mu_b + tau_b * z_b)
-
-        mu      = numpyro.deterministic( "mu", (a_a[None,:]*main_trend_a + a_b[None,:]*main_trend_b + b[None,:]) )
-
-        #--main trend
-        trend = mu 
-
-        #--Sigma resdiaul is hierarchical
-        mu_log_sigma = numpyro.sample("mu_log_sigma", dist.Normal(-2.0, 0.5))
-        tau_log_sigma = numpyro.sample("tau_log_sigma", dist.HalfNormal(0.3))
-        with numpyro.plate("season", S):
-            z_sigma = numpyro.sample("z_sigma", dist.Normal(0,1))
-            sigma = numpyro.deterministic("sigma_s", jnp.exp(mu_log_sigma + tau_log_sigma*z_sigma))
-
+        #sigma = numpyro.sample("sigma", dist.HalfNormal(1.0))
         #--X likelihood
         numpyro.sample( "llx", dist.Normal(trend[:,:-1], sigma[:-1]), obs = X.reshape(T,S-1) )
 
@@ -307,8 +347,8 @@ class puca( object ):
             numpyro.sample( "lly", dist.Normal(trend[:,-1].reshape(T,), sigma[-1]), obs = y.reshape(T,) )
 
         if forecast:
-            forecast = numpyro.sample("forecast", dist.Normal(trend[:,-1],sigma[-1]))
-            numpyro.deterministic("y_pred", forecast*global_std + global_mu)
+            forecast = numpyro.sample("forecast", dist.Normal(trend[:,-1], sigma[-1]))
+            numpyro.deterministic("y_pred", forecast * global_std + global_mu)
 
     def fit(self
             , M                          = 0
@@ -319,8 +359,7 @@ class puca( object ):
 
         #--MCMC start
         dense_blocks = [
-            ("repo_a_global", "repo_b_global", "gamma", "logit_I0"),
-            ("mu_log_a", "tau_log_a", "mu_log_b", "tau_log_b", "mu_b", "tau_b"),
+            ("repo_global", "gamma", "logit_I0", "repo_scale_local"),
         ]
 
         from patsy import dmatrix
@@ -338,6 +377,7 @@ class puca( object ):
         mcmc.run(jax.random.PRNGKey(20200320)
                               ,X            = Y
                               ,y            = (y - self.global_mu) / self.global_std
+                              ,anchor =  self.anchor
                               ,global_mu    = self.global_mu
                               ,global_std   = self.global_std
                               ,forecast     = None 
@@ -361,6 +401,7 @@ class puca( object ):
         pred_samples = predictive( rng_key
                               ,X            =  self.Y
                               ,y            = (self.y - self.global_mu) / self.global_std
+                              ,anchor =  self.anchor
                               ,global_mu    = self.global_mu
                               ,global_std   = self.global_std
                               ,forecast     = True
